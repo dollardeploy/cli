@@ -1,6 +1,6 @@
 {
   "name": "@dollardeploy/cli",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "DollarDeploy CLI — deploy, manage hosts, and control apps from the command line",
   "main": "deploy.js",
   "bin": {
