@@ -175,6 +175,8 @@ ddc host provision <host-id>
 | `--image`    | OS image (uses provider default if omitted)        | provider based |
 | `--timeout`  | Timeout in milliseconds                            | `600000`       |
 
+> Not sure which `--type`, `--region`, or `--image` values are valid? Run [`ddc provision --provider <p>`](#ddc-provision) to list everything the provider supports.
+
 ### `ddc host test <id>`
 
 Test the SSH connection to a host.
@@ -232,6 +234,64 @@ Remove a host from DollarDeploy without deprovisioning. The server continues run
 ddc host remove <host-id>
 ddc host remove <host-id> --yes     # DANGEROUS: Skip confirmation
 ```
+
+### `ddc provision`
+
+List the regions, instance types, and images a provider supports, queried live from the provider API. Use it to discover valid `--type`, `--region`, and `--image` values before running `ddc host create` or `ddc host provision`.
+
+The provider must be connected first (**Settings → Integrations** in the dashboard). `--provider` is required; all other flags narrow down the instance type list.
+
+```bash
+# List everything available for a provider
+ddc provision --provider hetzner
+
+# Only show types available in a region
+ddc provision --provider hetzner --region fsn1
+
+# Only show ARM types with at least 4 vCPUs and 8 GB memory
+ddc provision --provider hetzner --arch arm64 --cpu 4 --memory 8192
+
+# Full config as JSON (regions, types, images, defaults)
+ddc provision --provider do --json
+```
+
+Example output:
+
+```
+Provider: hetzner  default region: fsn1  default image: ubuntu-24.04  default arch: arm64
+
+Regions:
+id    label
+----  ------------
+fsn1  Falkenstein
+nbg1  Nuremberg
+hel1  Helsinki
+...
+
+Instance types:
+type   cpu  memoryGB  diskGB  arch   gpu  regions
+-----  ---  --------  ------  -----  ---  -------
+cax11  2    4         40      arm64       all
+cax21  4    8         80      arm64       all
+...
+
+Images:
+image
+------------
+ubuntu-24.04
+debian-12
+...
+```
+
+| Option       | Description                                                 | Default |
+| ------------ | ----------------------------------------------------------- | ------- |
+| `--provider` | **Required.** Cloud provider: `hetzner`, `do`, `datacrunch` | —       |
+| `--region`   | Filter instance types available in a region                 | —       |
+| `--type`     | Show details for a specific instance type                   | —       |
+| `--arch`     | Filter by architecture (e.g. `arm64`, `amd64`)              | —       |
+| `--cpu`      | Filter to types with at least N vCPUs                       | —       |
+| `--memory`   | Filter to types with at least N MB of memory                | —       |
+| `--disk`     | Filter to types with at least N GB of disk                  | —       |
 
 ### `ddc deploy`
 
@@ -511,13 +571,14 @@ await checkUrl(`https://${app.hostname}`);
 
 #### Provisioning
 
-| Method                                 | Description                                                                    |
-| -------------------------------------- | ------------------------------------------------------------------------------ |
-| `getProvision(hostId)`                 | Get provision config                                                           |
-| `saveProvision(hostId, data)`          | Save provision config                                                          |
-| `provisionHost(hostId)`                | Start provisioning                                                             |
-| `startProvision(hostId)`               | Alias for provisionHost                                                        |
-| `deprovisionHost(hostId, deleteHost?)` | Deprovision (deletes the host record when `deleteHost` is `true`, the default) |
+| Method                                  | Description                                                                    |
+| --------------------------------------- | ------------------------------------------------------------------------------ |
+| `getProvision(hostId)`                  | Get provision config                                                           |
+| `saveProvision(hostId, data)`           | Save provision config                                                          |
+| `provisionHost(hostId)`                 | Start provisioning                                                             |
+| `startProvision(hostId)`                | Alias for provisionHost                                                        |
+| `getProviderConfig(provider, filters?)` | List a provider's regions, instance types, and images                          |
+| `deprovisionHost(hostId, deleteHost?)`  | Deprovision (deletes the host record when `deleteHost` is `true`, the default) |
 
 #### Services
 

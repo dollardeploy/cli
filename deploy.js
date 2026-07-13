@@ -267,6 +267,14 @@ const createApiClient = auth => {
       }),
     saveProvision: (hostId, data) => patch(`/api/host/${hostId}/provision`, data),
     provisionHost: hostId => post(`/api/host/${hostId}/provision`),
+    getProviderConfig: (provider, filters = {}) =>
+      get(
+        `/api/provider/${provider}?` +
+          Object.entries(filters)
+            .filter(([, v]) => v !== undefined && v !== null && v !== "")
+            .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+            .join("&")
+      ),
     testConnection: hostId => post(`/api/host/${hostId}/test`),
     prepareHost: hostId => post(`/api/host/${hostId}/prepare`),
     createService: (hostId, type) => post(`/api/host/${hostId}/service/create`, { type }),
@@ -1331,6 +1339,63 @@ const cmdSshRemove = async (api, positional, flags) => {
   logger.info(`SSH key ${keyId} removed.`);
 };
 
+const cmdProvision = async (api, _positional, flags) => {
+  const provider = flags.provider;
+  if (!provider || flags.help) {
+    logger.info(
+      "ddc provision --provider <hetzner|do|datacrunch> [--region <r>] [--type <t>] [--arch <a>] [--cpu <n>] [--memory <mb>] [--disk <gb>]"
+    );
+    logger.info(
+      "Lists the regions, instance types and images available for a provider, so you know what to pass to `ddc host provision`."
+    );
+    process.exit(1);
+  }
+
+  const filters = {
+    region: flags.region,
+    type: flags.type,
+    arch: flags.arch,
+    cpu: flags.cpu,
+    memory: flags.memory,
+    disk: flags.disk
+  };
+
+  const config = await api.getProviderConfig(provider, filters);
+
+  if (jsonOutput) {
+    output(config);
+    return;
+  }
+
+  logger.info(
+    `Provider: ${config.id}  default region: ${config.defaultRegion}  default image: ${config.defaultImage}  default arch: ${config.defaultArch}`
+  );
+
+  logger.info("\nRegions:");
+  output((config.regions || []).map(r => ({ id: r.id, label: r.label })));
+
+  const hasFilters = Boolean(
+    flags.region || flags.type || flags.arch || flags.cpu || flags.memory || flags.disk
+  );
+  const types = hasFilters ? config.types : config.available || config.types;
+
+  logger.info(`\nInstance types${hasFilters ? " (matching filters)" : ""}:`);
+  output(
+    Object.entries(types || {}).map(([name, t]) => ({
+      type: name,
+      cpu: t.cpu,
+      memoryGB: Math.round((t.memory / 1024) * 10) / 10,
+      diskGB: t.disk,
+      arch: (t.arch || config.arch || []).join(","),
+      gpu: t.gpu ? `${t.gpu.count}x ${t.gpu.model}` : "",
+      regions: t.regions ? t.regions.join(",") : "all"
+    }))
+  );
+
+  logger.info("\nImages:");
+  output((config.images || []).map(image => ({ image })));
+};
+
 // ─── Flag extraction helpers ─────────────────────────────────────────────────
 
 const parseEnvValues = raw => {
@@ -1406,6 +1471,7 @@ COMMANDS
   task get <id>                 Show a task
   task cancel <id>              Cancel a running task
   logs                          Show journal logs (--task/--app/--host/--follow)
+  provision                     List available regions/types/images for a provider
   version                       Show CLI version
   help                          Show this help
 
@@ -1438,6 +1504,16 @@ HOST PROVISION OPTIONS
   --region <region>             Provider region (uses provider default if omitted)
   --image <image>               OS image (uses provider default if omitted)
   --timeout <ms>                Timeout in ms (default: 10 minutes)
+  Tip: run \`ddc provision --provider <p>\` to see valid types/regions/images.
+
+PROVISION OPTIONS (ddc provision — list available options for a provider)
+  --provider <provider>         Required: hetzner, do, datacrunch
+  --region <region>             Filter instance types available in a region
+  --type <type>                 Show details for a specific instance type
+  --arch <arch>                 Filter by architecture (e.g. arm64, amd64)
+  --cpu <n>                     Filter to types with at least N vCPUs
+  --memory <mb>                 Filter to types with at least N MB memory
+  --disk <gb>                   Filter to types with at least N GB disk
 
 HOST DESTROY / REMOVE / DEPROVISION OPTIONS
   --yes, --force                DANGEROUS: Skip confirmation prompt, remove host and all data permanently
@@ -1684,8 +1760,12 @@ const main = async () => {
       await cmdTask(api, positional.slice(1), flags);
     } else if (command === "logs") {
       await cmdLogs(api, positional.slice(1), flags);
+    } else if (command === "provision") {
+      await cmdProvision(api, positional.slice(1), flags);
     } else {
-      logger.info(`ddc <auth|user|host|app|deploy|build|ssh|template|task|logs|version|help>`);
+      logger.info(
+        `ddc <auth|user|host|app|deploy|build|ssh|template|task|logs|provision|version|help>`
+      );
       process.exit(1);
     }
   } catch (error) {
