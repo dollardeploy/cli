@@ -271,10 +271,22 @@ const createApiClient = auth => {
     prepareHost: hostId => post(`/api/host/${hostId}/prepare`),
     createService: (hostId, type) => post(`/api/host/${hostId}/service/create`, { type }),
     listServices: hostId => get(`/api/host/${hostId}/service`),
+    deleteService: (hostId, serviceId) => del(`/api/host/${hostId}/service/${serviceId}`),
     startProvision: hostId => post(`/api/host/${hostId}/provision`),
-    deprovisionHost: hostId => post(`/api/host/${hostId}/deprovision`, { deleteHost: true }),
+    deprovisionHost: (hostId, deleteHost = true) =>
+      post(`/api/host/${hostId}/deprovision`, { deleteHost }),
     getTask: id => get(`/api/task/${id}`),
+    listTasks: status => get(`/api/task${status ? `?status=${status}` : ""}`),
+    cancelTask: id => post(`/api/task/${id}/cancel`),
     getTaskJournal: id => get(`/api/journal/latest?taskId=${id}`),
+    getLogs: params =>
+      get(
+        "/api/journal/latest?" +
+          Object.entries(params)
+            .filter(([, v]) => v !== undefined && v !== null && v !== "")
+            .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+            .join("&")
+      ),
     getTemplates: () => get("/api/template"),
     getTemplate: id => get(`/api/template/${id}`),
     launchTemplate: args => post("/api/task/launch", args),
@@ -289,7 +301,8 @@ const createApiClient = auth => {
     deleteApp: id => del(`/api/app/${id}`),
     removeApp: (id, options = { deleteApp: false }) => post(`/api/app/${id}/remove`, options),
     listSshKeys: () => get("/api/settings/privateKey"),
-    createSshKey: data => post("/api/settings/privateKey/create", data)
+    createSshKey: data => post("/api/settings/privateKey/create", data),
+    deleteSshKey: id => del(`/api/settings/privateKey/${id}`)
   };
 };
 
@@ -401,7 +414,7 @@ const parseArgs = argv => {
         flags[key] = true;
       }
     } else if (arg.startsWith("-") && arg.length === 2) {
-      const shortMap = { v: "verbose", j: "json", h: "help", V: "version" };
+      const shortMap = { v: "verbose", j: "json", h: "help", V: "version", f: "follow" };
       const mapped = shortMap[arg[1]];
       if (mapped) {
         flags[mapped] = true;
@@ -1041,6 +1054,283 @@ const cmdTemplateList = async (api, positional, flags) => {
   );
 };
 
+const cmdLogs = async (api, _positional, flags) => {
+  if (flags.help) {
+    logger.info(
+      "ddc logs [--task <id>] [--app <id>] [--host <id>] [--type info,warn,error] [--limit <n>] [--follow]"
+    );
+    process.exit(1);
+  }
+
+  const params = {
+    limit: flags.limit || 50,
+    taskId: flags.task || flags.taskId,
+    appId: flags.app || flags.appId,
+    hostId: flags.host || flags.hostId,
+    type: flags.type
+  };
+
+  const printLogs = logs => {
+    if (jsonOutput) {
+      output(logs);
+      return;
+    }
+    for (const log of logs) {
+      logger.log(
+        `${new Date(log.createdAt).toISOString()}  ${String(log.type).padEnd(5)}  ${log.message}`
+      );
+    }
+  };
+
+  const follow = flags.follow === true || flags.f === true;
+
+  if (!follow) {
+    const { logs } = await api.getLogs(params);
+    // API returns newest first; print in chronological order
+    printLogs([...logs].reverse());
+    return;
+  }
+
+  const seen = new Set();
+  logger.info("Following logs (Ctrl+C to stop)...");
+  while (true) {
+    const { logs } = await api.getLogs(params);
+    const fresh = [...logs].reverse().filter(log => !seen.has(log.id));
+    for (const log of fresh) {
+      seen.add(log.id);
+    }
+    printLogs(fresh);
+    await sleep(2000);
+  }
+};
+
+const cmdTask = async (api, positional, flags) => {
+  const action = positional[0] || "list";
+
+  if (action === "list" || action === "ls") {
+    const status = flags.status || undefined;
+    const tasks = await api.listTasks(status);
+    output(
+      tasks.map(t => ({
+        id: t.id,
+        type: t.type,
+        status: t.status,
+        app: t.app?.name || "",
+        host: t.host?.name || "",
+        createdAt: t.createdAt
+      }))
+    );
+    return;
+  }
+
+  const taskId = positional[1] || flags.taskId;
+  if (!taskId) {
+    logger.error("ddc task <get|cancel> <task-id>");
+    process.exit(1);
+  }
+
+  if (action === "get") {
+    const task = await api.getTask(taskId);
+    output({
+      id: task.id,
+      type: task.type,
+      status: task.status,
+      appId: task.appId || "",
+      hostId: task.hostId || "",
+      createdAt: task.createdAt,
+      nextTaskId: task.nextTaskId || ""
+    });
+    return;
+  }
+
+  if (action === "cancel") {
+    await api.cancelTask(taskId);
+    logger.info(`Task ${taskId} cancelled.`);
+    return;
+  }
+
+  logger.error("ddc task <list|get|cancel> [<task-id>]");
+  process.exit(1);
+};
+
+const cmdHostService = async (api, positional, flags) => {
+  const action = positional[0];
+  const hostId = positional[1] || flags.hostId;
+
+  if (!action || !hostId) {
+    logger.error("ddc host service <list|add|remove> <host-id> [<type>|<service-id>]");
+    process.exit(1);
+  }
+
+  if (action === "list" || action === "ls") {
+    const services = await api.listServices(hostId);
+    output(
+      (services || []).map(s => ({
+        id: s.id,
+        type: s.type,
+        status: s.status ?? ""
+      }))
+    );
+    return;
+  }
+
+  if (action === "add") {
+    const type = positional[2] || flags.type;
+    if (!type) {
+      logger.error("ddc host service add <host-id> <type>");
+      process.exit(1);
+    }
+    logger.info(`Installing ${type} on host ${hostId}...`);
+    const service = await api.createService(hostId, type);
+    output({ id: service.id, type: service.type, status: service.status ?? "" });
+    return;
+  }
+
+  if (action === "remove" || action === "rm") {
+    const serviceId = positional[2] || flags.serviceId;
+    if (!serviceId) {
+      logger.error("ddc host service remove <host-id> <service-id>");
+      process.exit(1);
+    }
+    await api.deleteService(hostId, serviceId);
+    logger.info(`Service ${serviceId} removed from host ${hostId}.`);
+    return;
+  }
+
+  logger.error("ddc host service <list|add|remove>");
+  process.exit(1);
+};
+
+const cmdHostProvision = async (api, positional, flags) => {
+  const timeout = parseInt(flags.timeout) || DEFAULT_TIMEOUT;
+  const hostId = positional[0] || flags.hostId;
+  if (!hostId) {
+    logger.error(
+      "ddc host provision <host-id> [--provider <p>] [--type <t>] [--region <r>] [--image <i>]"
+    );
+    process.exit(1);
+  }
+
+  const provider = flags.provider;
+  if (provider) {
+    const providerType = flags.type || PROVIDER_DEFAULTS[provider]?.type;
+    const providerRegion = flags.region || PROVIDER_DEFAULTS[provider]?.region;
+    const image = flags.image || PROVIDER_DEFAULTS[provider]?.image;
+    if (!providerType || !providerRegion || !image) {
+      throw new Error(
+        `Incomplete config for ${provider}: type=${providerType}, region=${providerRegion}, image=${image}`
+      );
+    }
+    logger.info(
+      `Saving provision config (${provider} ${providerType} in ${providerRegion})...`
+    );
+    await api.saveProvision(hostId, { provider, providerType, providerRegion, image });
+  }
+
+  logger.info("Provisioning instance...");
+  const task = await api.startProvision(hostId);
+  await waitForTask(api, task.id, timeout);
+
+  const host = await api.getHost(hostId);
+  if (host.status !== "active") {
+    throw new Error(`Host is not active. Status: ${host.status}`);
+  }
+  logger.info("Instance provisioned.");
+  output({
+    id: host.id,
+    name: host.name,
+    status: host.status,
+    ip: host.ipAddress || "<not assigned>"
+  });
+};
+
+const cmdHostDeprovision = async (api, positional, flags) => {
+  const timeout = parseInt(flags.timeout) || DEFAULT_TIMEOUT;
+  const hostId = positional[0] || flags.hostId;
+  if (!hostId) {
+    logger.error("ddc host deprovision <host-id> [--yes]");
+    process.exit(1);
+  }
+
+  const host = await api.getHost(hostId);
+  if (!flags.yes && !flags.force) {
+    const ok = await confirm(
+      `This will deprovision the server instance for host "${host.name || host.id}" (${host.ipAddress || "no IP"}) but keep the host in DollarDeploy.\nContinue?`
+    );
+    if (!ok) {
+      logger.info("Aborted.");
+      return;
+    }
+  }
+
+  logger.info("Deprovisioning instance...");
+  const task = await api.deprovisionHost(hostId, false);
+  await waitForTask(api, task.id, timeout);
+  logger.info(`Host ${hostId} deprovisioned (record kept).`);
+};
+
+const cmdHostTest = async (api, positional, flags) => {
+  const timeout = parseInt(flags.timeout) || DEFAULT_TIMEOUT;
+  const hostId = positional[0] || flags.hostId;
+  if (!hostId) {
+    logger.error("ddc host test <host-id>");
+    process.exit(1);
+  }
+
+  logger.info(`Testing connection to host ${hostId}...`);
+  const task = await api.testConnection(hostId);
+  await waitForTask(api, task.id, timeout);
+  logger.info(`Host ${hostId} connection OK.`);
+};
+
+const cmdAppRemove = async (api, positional, flags) => {
+  const appId = positional[0] || flags.appId;
+  if (!appId) {
+    logger.error("ddc app remove <app-id> [--keep] [--yes]");
+    process.exit(1);
+  }
+
+  const timeout = parseInt(flags.timeout) || DEFAULT_TIMEOUT;
+  const deleteApp = flags.keep !== true;
+  const app = await api.getApp(appId);
+
+  if (!flags.yes && !flags.force) {
+    const ok = await confirm(
+      deleteApp
+        ? `This will undeploy and permanently delete app "${app.name || app.id}".\nContinue?`
+        : `This will undeploy app "${app.name || app.id}" but keep its configuration.\nContinue?`
+    );
+    if (!ok) {
+      logger.info("Aborted.");
+      return;
+    }
+  }
+
+  logger.info(`Removing app ${appId}...`);
+  const task = await api.removeApp(appId, { deleteApp });
+  await waitForTask(api, task.id, timeout);
+  logger.info(deleteApp ? `App ${appId} removed and deleted.` : `App ${appId} undeployed.`);
+};
+
+const cmdSshRemove = async (api, positional, flags) => {
+  const keyId = positional[0] || flags.id;
+  if (!keyId) {
+    logger.error("ddc ssh remove <key-id> [--yes]");
+    process.exit(1);
+  }
+
+  if (!flags.yes && !flags.force) {
+    const ok = await confirm(`This will delete SSH key ${keyId}.\nContinue?`);
+    if (!ok) {
+      logger.info("Aborted.");
+      return;
+    }
+  }
+
+  await api.deleteSshKey(keyId);
+  logger.info(`SSH key ${keyId} removed.`);
+};
+
 // ─── Flag extraction helpers ─────────────────────────────────────────────────
 
 const parseEnvValues = raw => {
@@ -1090,9 +1380,15 @@ COMMANDS
   auth                          Authenticate with DollarDeploy
   host list                     List all hosts
   host create                   Create and provision a new host
+  host provision <id>           Provision (or reprovision) a server for a host
+  host deprovision <id>         Deprovision the server but keep the host record
+  host test <id>                Test SSH connection to a host
   host destroy <id>             Deprovision and permanently delete a host
   host remove <id>              Remove a host from DollarDeploy (keeps the server)
   host prepare <id>             Prepare a host for deployment
+  host service list <id>        List services installed on a host
+  host service add <id> <type>  Install a service on a host (e.g. docker)
+  host service remove <id> <sid> Remove a service from a host
   app list                      List all apps
   app create                    Create a new app (see below for options)
   app modify <id>               Modify an existing app
@@ -1101,9 +1397,15 @@ COMMANDS
   app deploy --appId <id>       Redeploy existing app
   app deploy --url <url>        Redeploy existing app with the same repository URL
   app build <app-id>            Build an app (optionally deploy)
+  app remove <id>               Undeploy an app (and delete it unless --keep)
   ssh list                      List all SSH keys
   ssh add <private-key-file>    Add an SSH key to your account
+  ssh remove <id>               Delete an SSH key from your account
   template list                 List all templates
+  task list                     List tasks (--status to filter)
+  task get <id>                 Show a task
+  task cancel <id>              Cancel a running task
+  logs                          Show journal logs (--task/--app/--host/--follow)
   version                       Show CLI version
   help                          Show this help
 
@@ -1130,8 +1432,30 @@ HOST CREATE OPTIONS
   --skip-prepare                Skip host preparation step
   --timeout <ms>                Timeout in ms (default: 10 minutes)
 
-HOST DESTROY / REMOVE OPTIONS
+HOST PROVISION OPTIONS
+  --provider <provider>         Provider to save before provisioning (hetzner, do, datacrunch)
+  --type <type>                 Instance type (uses provider default if omitted)
+  --region <region>             Provider region (uses provider default if omitted)
+  --image <image>               OS image (uses provider default if omitted)
+  --timeout <ms>                Timeout in ms (default: 10 minutes)
+
+HOST DESTROY / REMOVE / DEPROVISION OPTIONS
   --yes, --force                DANGEROUS: Skip confirmation prompt, remove host and all data permanently
+
+APP REMOVE OPTIONS
+  --keep                        Keep the app configuration (undeploy only)
+  --yes, --force                Skip confirmation prompt
+
+TASK OPTIONS
+  --status <status>             Filter task list by status
+
+LOGS OPTIONS
+  --task <id>                   Filter logs by task ID
+  --app <id>                    Filter logs by app ID
+  --host <id>                   Filter logs by host ID
+  --type <types>                Log types (comma separated: info,warn,error,health,log,ai)
+  --limit <n>                   Number of records (default: 50)
+  --follow, -f                  Continuously poll for new logs
 
 APP DEPLOY OPTIONS
   --url <github-url>            Deploy from a GitHub repository
@@ -1299,12 +1623,22 @@ const main = async () => {
         await cmdHostList(api, positional.slice(2), flags);
       } else if (subcommand === "create") {
         await cmdHostCreate(api, positional.slice(2), flags);
+      } else if (subcommand === "provision") {
+        await cmdHostProvision(api, positional.slice(2), flags);
+      } else if (subcommand === "deprovision") {
+        await cmdHostDeprovision(api, positional.slice(2), flags);
+      } else if (subcommand === "test") {
+        await cmdHostTest(api, positional.slice(2), flags);
+      } else if (subcommand === "service" || subcommand === "services") {
+        await cmdHostService(api, positional.slice(2), flags);
       } else if (subcommand === "destroy") {
         await cmdHostDestroy(api, positional.slice(2), flags);
       } else if (subcommand === "remove" || subcommand === "rm") {
         await cmdHostRemove(api, positional.slice(2), flags);
       } else {
-        logger.error(`ddc host <prepare|list|create|destroy|remove>`);
+        logger.error(
+          `ddc host <prepare|list|create|provision|deprovision|test|service|destroy|remove>`
+        );
         process.exit(1);
       }
     } else if (command === "app") {
@@ -1318,8 +1652,10 @@ const main = async () => {
         await cmdAppBuild(api, positional.slice(2), flags);
       } else if (subcommand === "deploy") {
         await cmdAppDeploy(api, positional.slice(2), flags);
+      } else if (subcommand === "remove" || subcommand === "rm") {
+        await cmdAppRemove(api, positional.slice(2), flags);
       } else {
-        logger.error(`ddc app <list|create|modify|build|deploy>`);
+        logger.error(`ddc app <list|create|modify|build|deploy|remove>`);
         process.exit(1);
       }
     } else if (command === "deploy") {
@@ -1331,8 +1667,10 @@ const main = async () => {
         await cmdSshList(api, positional.slice(2), flags);
       } else if (subcommand === "add") {
         await cmdSshAdd(api, positional.slice(2), flags);
+      } else if (subcommand === "remove" || subcommand === "rm") {
+        await cmdSshRemove(api, positional.slice(2), flags);
       } else {
-        logger.error(`ddc ssh <list|add>`);
+        logger.error(`ddc ssh <list|add|remove>`);
         process.exit(1);
       }
     } else if (command === "template") {
@@ -1342,8 +1680,12 @@ const main = async () => {
         logger.error(`ddc template <list>`);
         process.exit(1);
       }
+    } else if (command === "task") {
+      await cmdTask(api, positional.slice(1), flags);
+    } else if (command === "logs") {
+      await cmdLogs(api, positional.slice(1), flags);
     } else {
-      logger.info(`ddc <auth|user|host|app|deploy|build|ssh|template|version|help>`);
+      logger.info(`ddc <auth|user|host|app|deploy|build|ssh|template|task|logs|version|help>`);
       process.exit(1);
     }
   } catch (error) {

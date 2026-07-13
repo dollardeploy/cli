@@ -52,6 +52,46 @@ ddc deploy --url https://github.com/your-org/your-app --create-host
 ddc deploy --template nextjs-boilerplate --hostId <host-id>
 ```
 
+## Host Lifecycle
+
+A host goes through a few stages: **create** → **provision** → **prepare** → (deploy apps) → **deprovision** / **destroy**.
+
+`ddc host create --provider ...` runs all of the setup steps for you in one call. The individual commands exist for when you want to run a stage on its own — for example, provisioning a server for a host you created earlier, or re-preparing a host without touching the VM.
+
+```bash
+# 1. Create the host record and provision a server in one step
+ddc host create --name my-server --provider hetzner
+#    ↳ creates the host, provisions the VM, tests SSH, installs services, prepares it
+
+# --- or run the stages yourself ---
+
+# 1a. Create just the host record (no server yet)
+ddc host create --name my-server
+#    → prints the new host id, status: draft
+
+# 1b. Provision a server for that host
+ddc host provision <host-id> --provider hetzner
+#    → status: active, IP assigned
+
+# 1c. Verify SSH connectivity
+ddc host test <host-id>
+
+# 1d. Prepare the host for deployments (installs Docker, configures the box)
+ddc host prepare <host-id>
+
+# 2. Deploy apps to it
+ddc deploy --url https://github.com/org/repo --hostId <host-id>
+
+# 3. When you're done, tear it down
+ddc host destroy <host-id>          # deprovision the VM AND delete the host record
+# or, to keep the host record but delete the server:
+ddc host deprovision <host-id>
+# or, to stop managing it without deleting the server:
+ddc host remove <host-id>
+```
+
+> **Tip:** run `ddc host list` at any point to see each host's `status` and `ip`. Long-running stages (provision, prepare, deploy) print progress; add `--json` for machine-readable output.
+
 ## Commands
 
 ### `ddc auth`
@@ -104,16 +144,44 @@ ddc host create --name my-server --provider verda --type CPU.4V.16G --region FIN
 ddc host create --name my-server --services docker,postgres
 ```
 
-| Option             | Description                                            | Default         |
-| ------------------ | ------------------------------------------------------ | --------------- |
-| `--name`           | Host name                                              | auto-generated  |
-| `--provider`       | Cloud provider: `hetzner`, `do`, `datacrunch`          | `hetzner`       |
-| `--type`           | Instance type                                          | `cax11`         |
-| `--region`         | Provider region                                        | `fsn1`          |
-| `--image`          | OS image                                               | `ubuntu-24.04`  |
-| `--services`       | Comma-separated services to install                    | `docker`        |
-| `--skip-prepare`   | Skip host preparation step                             | `false`         |
-| `--timeout`        | Timeout in milliseconds                                | `600000`        |
+| Option           | Description                                   | Default        |
+| ---------------- | --------------------------------------------- | -------------- |
+| `--name`         | Host name                                     | auto-generated |
+| `--provider`     | Cloud provider: `hetzner`, `do`, `datacrunch` | `hetzner`      |
+| `--type`         | Instance type                                 | `cax11`        |
+| `--region`       | Provider region                               | `fsn1`         |
+| `--image`        | OS image                                      | `ubuntu-24.04` |
+| `--services`     | Comma-separated services to install           | `docker`       |
+| `--skip-prepare` | Skip host preparation step                    | `false`        |
+| `--timeout`      | Timeout in milliseconds                       | `600000`       |
+
+### `ddc host provision <id>`
+
+Provision (or reprovision) a server for an existing host. Pass provider flags to save the provider config before provisioning; omit them to provision using the config already saved on the host.
+
+```bash
+# Provision using flags
+ddc host provision <host-id> --provider hetzner --type cax11 --region fsn1
+
+# Provision using the host's already-saved provider config
+ddc host provision <host-id>
+```
+
+| Option       | Description                                        | Default        |
+| ------------ | -------------------------------------------------- | -------------- |
+| `--provider` | Save this provider before provisioning             | —              |
+| `--type`     | Instance type (uses provider default if omitted)   | provider based |
+| `--region`   | Provider region (uses provider default if omitted) | provider based |
+| `--image`    | OS image (uses provider default if omitted)        | provider based |
+| `--timeout`  | Timeout in milliseconds                            | `600000`       |
+
+### `ddc host test <id>`
+
+Test the SSH connection to a host.
+
+```bash
+ddc host test <host-id>
+```
 
 ### `ddc host prepare <id>`
 
@@ -123,9 +191,33 @@ Prepare a host for deployment. This will install the necessary services and conf
 ddc host prepare <host-id>
 ```
 
+### `ddc host service`
+
+Manage the services (Docker, PostgreSQL, etc.) installed on a host.
+
+```bash
+# List installed services
+ddc host service list <host-id>
+
+# Install a service
+ddc host service add <host-id> docker
+
+# Remove a service
+ddc host service remove <host-id> <service-id>
+```
+
+### `ddc host deprovision <id>`
+
+Deprovision the server (removes the VM from your cloud provider) but keep the host record in DollarDeploy, so you can provision it again later.
+
+```bash
+ddc host deprovision <host-id>
+ddc host deprovision <host-id> --yes    # Skip confirmation
+```
+
 ### `ddc host destroy <id>`
 
-Deprovision and permanently delete a host. This removes the VM from your cloud provider.
+Deprovision and permanently delete a host. This removes the VM from your cloud provider and deletes the host record along with all apps on it.
 
 ```bash
 ddc host destroy <host-id>
@@ -169,21 +261,21 @@ ddc deploy --url https://github.com/org/repo --hostId <host-id> --set:mainPort 8
 
 The deploy command is smart about redeployment — if you deploy the same GitHub URL to the same host, it will detect the existing app and redeploy it instead of creating a duplicate.
 
-| Option             | Description                                            |
-| ------------------ | ------------------------------------------------------ |
-| `--url`            | GitHub repository URL                                  |
-| `--template`       | Template ID to deploy                                  |
-| `--appId`          | Existing app ID to redeploy                            |
-| `--hostId`         | Target host ID                                         |
-| `--create-host`    | Create a new host for deployment                       |
-| `--name`           | App name                                               |
-| `--env NAME=VALUE` | Set environment variable                               |
-| `--set:<key>`      | Set app property (mainPort, env:PROPERTY_NAME, etc.)   |
-| `--provider`       | Provider for `--create-host`                           |
-| `--type`           | Instance type for `--create-host`                      |
-| `--region`         | Region for `--create-host`                             |
-| `--services`       | Services for `--create-host`                           |
-| `--timeout`        | Timeout in milliseconds (default: 600000)              |
+| Option             | Description                                          |
+| ------------------ | ---------------------------------------------------- |
+| `--url`            | GitHub repository URL                                |
+| `--template`       | Template ID to deploy                                |
+| `--appId`          | Existing app ID to redeploy                          |
+| `--hostId`         | Target host ID                                       |
+| `--create-host`    | Create a new host for deployment                     |
+| `--name`           | App name                                             |
+| `--env NAME=VALUE` | Set environment variable                             |
+| `--set:<key>`      | Set app property (mainPort, env:PROPERTY_NAME, etc.) |
+| `--provider`       | Provider for `--create-host`                         |
+| `--type`           | Instance type for `--create-host`                    |
+| `--region`         | Region for `--create-host`                           |
+| `--services`       | Services for `--create-host`                         |
+| `--timeout`        | Timeout in milliseconds (default: 600000)            |
 
 ### `ddc build`
 
@@ -210,6 +302,22 @@ ddc app list
 ddc app list --json
 ```
 
+### `ddc app remove <id>`
+
+Undeploy an app from its host. By default the app is also deleted; use `--keep` to undeploy but keep the app configuration for later.
+
+```bash
+ddc app remove <app-id>             # Undeploy and delete the app
+ddc app remove <app-id> --keep      # Undeploy but keep the configuration
+ddc app remove <app-id> --yes       # Skip confirmation
+```
+
+| Option             | Description                                |
+| ------------------ | ------------------------------------------ |
+| `--keep`           | Keep the app configuration (undeploy only) |
+| `--yes`, `--force` | Skip confirmation prompt                   |
+| `--timeout`        | Timeout in milliseconds (default: 600000)  |
+
 ### `ddc template list`
 
 List all templates.
@@ -228,9 +336,9 @@ Add an SSH public key to your DollarDeploy account.
 ddc ssh add ${HOME}/.ssh/id_rsa --name my-key
 ```
 
-| Option    | Description                        |
-| --------- | ---------------------------------- |
-| `--name`  | Key name (default: cli-added-key)  |
+| Option   | Description                       |
+| -------- | --------------------------------- |
+| `--name` | Key name (default: cli-added-key) |
 
 ### `ddc ssh list`
 
@@ -241,16 +349,56 @@ ddc ssh list
 ddc ssh list --name my-key
 ```
 
+### `ddc ssh remove <id>`
+
+Delete an SSH key from your account.
+
+```bash
+ddc ssh remove <key-id>
+ddc ssh remove <key-id> --yes       # Skip confirmation
+```
+
+### `ddc task`
+
+Inspect and control the background tasks that run provisioning, builds, and deployments.
+
+```bash
+ddc task list                       # List recent tasks
+ddc task list --status running      # Filter by status
+ddc task get <task-id>              # Show a single task
+ddc task cancel <task-id>           # Cancel a running task
+```
+
+### `ddc logs`
+
+Show journal logs. Filter by task, app, or host, and optionally follow for new entries.
+
+```bash
+ddc logs --task <task-id>
+ddc logs --app <app-id>
+ddc logs --host <host-id>
+ddc logs --app <app-id> --follow    # Stream new log entries
+```
+
+| Option           | Description                                                  | Default           |
+| ---------------- | ------------------------------------------------------------ | ----------------- |
+| `--task`         | Filter logs by task ID                                       | —                 |
+| `--app`          | Filter logs by app ID                                        | —                 |
+| `--host`         | Filter logs by host ID                                       | —                 |
+| `--type`         | Log types (comma separated: `info,warn,error,health,log,ai`) | `info,warn,error` |
+| `--limit`        | Number of records                                            | `50`              |
+| `--follow`, `-f` | Continuously poll for new logs                               | `false`           |
+
 ## Global Options
 
-| Option              | Description                                        |
-| ------------------- | -------------------------------------------------- |
-| `--api-key <key>`   | API key (overrides stored auth and env var)         |
-| `--base-url <url>`  | API base URL (default: `https://dollardeploy.com`) |
-| `--json`            | Output as JSON (machine-readable)                  |
-| `--verbose`, `-v`   | Enable verbose logging                             |
-| `--help`, `-h`      | Show help                                          |
-| `--version`, `-V`   | Show version                                       |
+| Option             | Description                                        |
+| ------------------ | -------------------------------------------------- |
+| `--api-key <key>`  | API key (overrides stored auth and env var)        |
+| `--base-url <url>` | API base URL (default: `https://dollardeploy.com`) |
+| `--json`           | Output as JSON (machine-readable)                  |
+| `--verbose`, `-v`  | Enable verbose logging                             |
+| `--help`, `-h`     | Show help                                          |
+| `--version`, `-V`  | Show version                                       |
 
 ## JSON Output (AI Agent Friendly)
 
@@ -272,11 +420,11 @@ JSON output goes to stdout, while progress/status messages go to stderr, making 
 
 ## Provider Defaults
 
-| Provider     | Type           | Region   | Image          |
-| ------------ | -------------- | -------- | -------------- |
-| Hetzner      | `cax11`        | `fsn1`   | `ubuntu-24.04` |
-| DigitalOcean | `s-2vcpu-4gb`  | `fra1`   | `ubuntu-24-04` |
-| Verda Cloud  | `CPU.4V.16G`   | `FIN-01` | `ubuntu-24.04` |
+| Provider     | Type          | Region   | Image          |
+| ------------ | ------------- | -------- | -------------- |
+| Hetzner      | `cax11`       | `fsn1`   | `ubuntu-24.04` |
+| DigitalOcean | `s-2vcpu-4gb` | `fra1`   | `ubuntu-24-04` |
+| Verda Cloud  | `CPU.4V.16G`  | `FIN-01` | `ubuntu-24.04` |
 
 ## CI/CD Integration
 
@@ -315,7 +463,10 @@ Use the CLI as a Node.js library:
 ```javascript
 const { createApiClient, waitForTask, checkUrl } = require("@dollardeploy/cli");
 
-const api = createApiClient("https://dollardeploy.com", process.env.DOLLARDEPLOY_API_KEY);
+const api = createApiClient({
+  apiKey: process.env.DOLLARDEPLOY_API_KEY,
+  baseUrl: "https://dollardeploy.com"
+});
 
 // List all hosts
 const hosts = await api.listHosts();
@@ -360,20 +511,21 @@ await checkUrl(`https://${app.hostname}`);
 
 #### Provisioning
 
-| Method                        | Description             |
-| ----------------------------- | ----------------------- |
-| `getProvision(hostId)`        | Get provision config    |
-| `saveProvision(hostId, data)` | Save provision config   |
-| `provisionHost(hostId)`       | Start provisioning      |
-| `startProvision(hostId)`      | Alias for provisionHost |
-| `deprovisionHost(hostId)`     | Deprovision and delete  |
+| Method                                 | Description                                                                    |
+| -------------------------------------- | ------------------------------------------------------------------------------ |
+| `getProvision(hostId)`                 | Get provision config                                                           |
+| `saveProvision(hostId, data)`          | Save provision config                                                          |
+| `provisionHost(hostId)`                | Start provisioning                                                             |
+| `startProvision(hostId)`               | Alias for provisionHost                                                        |
+| `deprovisionHost(hostId, deleteHost?)` | Deprovision (deletes the host record when `deleteHost` is `true`, the default) |
 
 #### Services
 
-| Method                        | Description             |
-| ----------------------------- | ----------------------- |
-| `listServices(hostId)`        | List installed services |
-| `createService(hostId, type)` | Install a service       |
+| Method                             | Description             |
+| ---------------------------------- | ----------------------- |
+| `listServices(hostId)`             | List installed services |
+| `createService(hostId, type)`      | Install a service       |
+| `deleteService(hostId, serviceId)` | Remove a service        |
 
 #### Apps
 
@@ -391,10 +543,11 @@ await checkUrl(`https://${app.hostname}`);
 
 #### SSH Keys
 
-| Method                   | Description        |
-| ------------------------ | ------------------ |
-| `listSshKeys()`          | List all SSH keys  |
-| `createSshKey(data)`     | Create an SSH key  |
+| Method               | Description       |
+| -------------------- | ----------------- |
+| `listSshKeys()`      | List all SSH keys |
+| `createSshKey(data)` | Create an SSH key |
+| `deleteSshKey(id)`   | Delete an SSH key |
 
 #### Templates
 
@@ -406,16 +559,19 @@ await checkUrl(`https://${app.hostname}`);
 
 #### Tasks
 
-| Method               | Description     |
-| -------------------- | --------------- |
-| `getTask(id)`        | Get task status |
-| `getTaskJournal(id)` | Get task logs   |
+| Method               | Description                     |
+| -------------------- | ------------------------------- |
+| `getTask(id)`        | Get task status                 |
+| `listTasks(status?)` | List tasks (optionally filter)  |
+| `cancelTask(id)`     | Cancel a running task           |
+| `getTaskJournal(id)` | Get task logs                   |
+| `getLogs(params)`    | Query journal logs with filters |
 
 #### User
 
-| Method       | Description            |
-| ------------ | ---------------------- |
-| `getUser()`  | Get current user info  |
+| Method      | Description           |
+| ----------- | --------------------- |
+| `getUser()` | Get current user info |
 
 ## Links
 
