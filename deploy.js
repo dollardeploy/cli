@@ -81,6 +81,26 @@ const output = data => {
   }
 };
 
+// Render a value for plain-text (non-JSON) output. Arrays are comma-joined and
+// objects (e.g. env, provision) become a compact `key=value` string instead of
+// the useless `[object Object]`.
+const formatFieldValue = value => {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map(item => (item && typeof item === "object" ? JSON.stringify(item) : String(item)))
+      .join(", ");
+  }
+  if (typeof value === "object") {
+    return Object.entries(value)
+      .map(([k, v]) => `${k}=${v && typeof v === "object" ? JSON.stringify(v) : v}`)
+      .join(", ");
+  }
+  return String(value);
+};
+
 // ─── Auth helpers ────────────────────────────────────────────────────────────
 
 const findAuth = baseUrl => {
@@ -279,6 +299,7 @@ const createApiClient = auth => {
     prepareHost: hostId => post(`/api/host/${hostId}/prepare`),
     createService: (hostId, type) => post(`/api/host/${hostId}/service/create`, { type }),
     listServices: hostId => get(`/api/host/${hostId}/service`),
+    getService: (hostId, serviceId) => get(`/api/host/${hostId}/service/${serviceId}`),
     deleteService: (hostId, serviceId) => del(`/api/host/${hostId}/service/${serviceId}`),
     startProvision: hostId => post(`/api/host/${hostId}/provision`),
     deprovisionHost: (hostId, deleteHost = true) =>
@@ -462,6 +483,11 @@ const cmdHostList = async (api, _positional, flags) => {
   const status = flags.status || undefined;
   const hosts = await api.listHosts(status);
 
+  if (jsonOutput || flags.all) {
+    output(hosts);
+    return;
+  }
+
   const rows = hosts.map(h => ({
     id: h.id,
     name: h.name || "",
@@ -474,29 +500,104 @@ const cmdHostList = async (api, _positional, flags) => {
   output(rows);
 };
 
-const cmdAppList = async (api, _positional, flags) => {
-  const apps = await api.listApps();
+const cmdHostGet = async (api, positional, flags) => {
+  const hostId = positional[0] || flags.hostId;
   const help = flags.help;
-  const fields = flags.all
-    ? undefined
-    : flags.fields?.split(",") || ["id", "name", "status", "repositoryUrl", "hostname"];
+
+  if (!hostId || help) {
+    logger.info("ddc host get <host-id> [--all]");
+    process.exit(hostId ? 0 : 1);
+  }
+
+  const host = await api.getHost(hostId);
+  const provision = await api.getProvision(hostId);
+
+  if (jsonOutput || flags.all) {
+    output({ ...host, provision });
+    return;
+  }
+
+  // Plain text: show all host fields except noisy objects, plus formatted provision.
+  const excluded = new Set(["health", "apps", "project"]);
+  const row = {};
+  for (const [key, value] of Object.entries(host)) {
+    if (excluded.has(key)) {
+      continue;
+    }
+    row[key] = formatFieldValue(value);
+  }
+  row.provision = provision ? formatFieldValue(provision) : "";
+  output(row);
+};
+
+const cmdAppList = async (api, _positional, flags) => {
+  const help = flags.help;
 
   if (help) {
     logger.info("ddc app list [--fields <fields>|--all]");
     process.exit(0);
   }
 
+  const apps = await api.listApps();
+
+  if (jsonOutput || flags.all) {
+    output(apps);
+    return;
+  }
+
+  const fields = flags.fields?.split(",") || [
+    "id",
+    "name",
+    "status",
+    "repositoryUrl",
+    "hostname"
+  ];
+
   const rows = apps.map(a =>
-    fields === undefined
-      ? a
-      : {
-          ...Object.fromEntries(
-            fields.map(f => [f, f === "hostname" && a[f] ? "https://" + a[f] : a[f]])
-          )
-        }
+    Object.fromEntries(
+      fields.map(f => [f, f === "hostname" && a[f] ? "https://" + a[f] : a[f]])
+    )
   );
 
   output(rows);
+};
+
+const cmdAppGet = async (api, positional, flags) => {
+  const appId = positional[0] || flags.appId;
+  const help = flags.help;
+
+  if (!appId || help) {
+    logger.info("ddc app get <app-id> [--fields <fields>|--all]");
+    process.exit(appId ? 0 : 1);
+  }
+
+  const app = await api.getApp(appId);
+
+  if (jsonOutput || flags.all) {
+    output(app);
+    return;
+  }
+
+  if (flags.fields) {
+    const fields = flags.fields.split(",");
+    output(
+      Object.fromEntries(
+        fields.map(f => [f, f === "hostname" && app[f] ? "https://" + app[f] : (app[f] ?? "")])
+      )
+    );
+    return;
+  }
+
+  // Plain text: show all app fields except noisy objects (host, project).
+  const excluded = new Set(["host", "project"]);
+  const row = {};
+  for (const [key, value] of Object.entries(app)) {
+    if (excluded.has(key)) {
+      continue;
+    }
+    row[key] = key === "hostname" && value ? "https://" + value : formatFieldValue(value);
+  }
+  output(row);
 };
 
 const cmdSshList = async (api, _positional, flags) => {
@@ -1166,12 +1267,16 @@ const cmdHostService = async (api, positional, flags) => {
   const hostId = positional[1] || flags.hostId;
 
   if (!action || !hostId) {
-    logger.error("ddc host service <list|add|remove> <host-id> [<type>|<service-id>]");
+    logger.error("ddc host service <list|get|add|remove> <host-id> [<type>|<service-id>]");
     process.exit(1);
   }
 
   if (action === "list" || action === "ls") {
     const services = await api.listServices(hostId);
+    if (jsonOutput || flags.all) {
+      output(services || []);
+      return;
+    }
     output(
       (services || []).map(s => ({
         id: s.id,
@@ -1179,6 +1284,21 @@ const cmdHostService = async (api, positional, flags) => {
         status: s.status ?? ""
       }))
     );
+    return;
+  }
+
+  if (action === "get") {
+    const serviceId = positional[2] || flags.serviceId;
+    if (!serviceId) {
+      logger.error("ddc host service get <host-id> <service-id> [--all]");
+      process.exit(1);
+    }
+    const service = await api.getService(hostId, serviceId);
+    if (jsonOutput || flags.all) {
+      output(service);
+      return;
+    }
+    output({ id: service.id, type: service.type, status: service.status ?? "" });
     return;
   }
 
@@ -1205,7 +1325,7 @@ const cmdHostService = async (api, positional, flags) => {
     return;
   }
 
-  logger.error("ddc host service <list|add|remove>");
+  logger.error("ddc host service <list|get|add|remove>");
   process.exit(1);
 };
 
@@ -1444,6 +1564,7 @@ USAGE
 COMMANDS
   auth                          Authenticate with DollarDeploy
   host list                     List all hosts
+  host get <id>                 Show a single host
   host create                   Create and provision a new host
   host provision <id>           Provision (or reprovision) a server for a host
   host deprovision <id>         Deprovision the server but keep the host record
@@ -1452,9 +1573,11 @@ COMMANDS
   host remove <id>              Remove a host from DollarDeploy (keeps the server)
   host prepare <id>             Prepare a host for deployment
   host service list <id>        List services installed on a host
+  host service get <id> <sid>   Show a single service on a host
   host service add <id> <type>  Install a service on a host (e.g. docker)
   host service remove <id> <sid> Remove a service from a host
   app list                      List all apps
+  app get <id>                  Show a single app
   app create                    Create a new app (see below for options)
   app modify <id>               Modify an existing app
   app deploy --url <url>        Deploy new app from GitHub to a host
@@ -1697,6 +1820,8 @@ const main = async () => {
         await cmdHostPrepare(api, positional.slice(2), flags);
       } else if (subcommand === "list" || subcommand === "ls") {
         await cmdHostList(api, positional.slice(2), flags);
+      } else if (subcommand === "get") {
+        await cmdHostGet(api, positional.slice(2), flags);
       } else if (subcommand === "create") {
         await cmdHostCreate(api, positional.slice(2), flags);
       } else if (subcommand === "provision") {
@@ -1713,13 +1838,15 @@ const main = async () => {
         await cmdHostRemove(api, positional.slice(2), flags);
       } else {
         logger.error(
-          `ddc host <prepare|list|create|provision|deprovision|test|service|destroy|remove>`
+          `ddc host <prepare|list|get|create|provision|deprovision|test|service|destroy|remove>`
         );
         process.exit(1);
       }
     } else if (command === "app") {
       if (subcommand === "list" || subcommand === "ls") {
         await cmdAppList(api, positional.slice(2), flags);
+      } else if (subcommand === "get") {
+        await cmdAppGet(api, positional.slice(2), flags);
       } else if (subcommand === "create") {
         await cmdAppCreate(api, positional.slice(2), flags);
       } else if (subcommand === "modify") {
@@ -1731,7 +1858,7 @@ const main = async () => {
       } else if (subcommand === "remove" || subcommand === "rm") {
         await cmdAppRemove(api, positional.slice(2), flags);
       } else {
-        logger.error(`ddc app <list|create|modify|build|deploy|remove>`);
+        logger.error(`ddc app <list|get|create|modify|build|deploy|remove>`);
         process.exit(1);
       }
     } else if (command === "deploy") {
