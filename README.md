@@ -123,6 +123,16 @@ ddc host list --status active
 ddc host list --json              # Machine-readable output
 ```
 
+### `ddc host get <id>`
+
+Show a single host. Plain-text output lists every host field except the noisy objects (`health`, `apps`, `project`) and includes the `provision` config formatted inline. Use `--json` or `--all` for the full host object.
+
+```bash
+ddc host get <host-id>
+ddc host get <host-id> --json     # Full host object incl. provision
+ddc host get <host-id> --all      # Full host object as key: value
+```
+
 ### `ddc host create`
 
 Create and provision a new host. You need to set the integration with your cloud provider first in the DollarDeploy Settings => Integrations.
@@ -200,6 +210,9 @@ Manage the services (Docker, PostgreSQL, etc.) installed on a host.
 ```bash
 # List installed services
 ddc host service list <host-id>
+
+# Show a single service (--all for the full object)
+ddc host service get <host-id> <service-id>
 
 # Install a service
 ddc host service add <host-id> docker
@@ -362,6 +375,17 @@ ddc app list
 ddc app list --json
 ```
 
+### `ddc app get <id>`
+
+Show a single app. Plain-text output lists every app field except the noisy objects (`host`, `project`); `env` is formatted inline. Use `--fields` to pick specific columns, or `--json`/`--all` for the full app object.
+
+```bash
+ddc app get <app-id>
+ddc app get <app-id> --json                       # Full app object incl. env
+ddc app get <app-id> --fields id,name,status,hostname
+ddc app get <app-id> --all        # Full app object as key: value
+```
+
 ### `ddc app remove <id>`
 
 Undeploy an app from its host. By default the app is also deleted; use `--keep` to undeploy but keep the app configuration for later.
@@ -468,6 +492,8 @@ All commands support `--json` for structured, machine-readable output:
 ddc host list --json
 ddc deploy --url https://github.com/org/repo --hostId <id> --json
 ```
+
+For `get`/`list` commands (`app`, `host`, `host service`), `--json` returns the **full object** — every field the API returns, including `env` — not just the curated columns shown in the plain-text table. Use `--all` to get the same full object in plain-text (`key: value`) form.
 
 JSON output goes to stdout, while progress/status messages go to stderr, making it easy to pipe results into other tools.
 
@@ -585,6 +611,7 @@ await checkUrl(`https://${app.hostname}`);
 | Method                             | Description             |
 | ---------------------------------- | ----------------------- |
 | `listServices(hostId)`             | List installed services |
+| `getService(hostId, serviceId)`    | Get a single service    |
 | `createService(hostId, type)`      | Install a service       |
 | `deleteService(hostId, serviceId)` | Remove a service        |
 
