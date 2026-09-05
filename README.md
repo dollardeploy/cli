@@ -154,16 +154,16 @@ ddc host create --name my-server --provider verda --type CPU.4V.16G --region FIN
 ddc host create --name my-server --services docker,postgres
 ```
 
-| Option           | Description                              | Default        |
-| ---------------- | ---------------------------------------- | -------------- |
-| `--name`         | Host name                                | auto-generated |
-| `--provider`     | Cloud provider: `hetzner`, `do`, `verda` | `hetzner`      |
-| `--type`         | Instance type                            | `cax11`        |
-| `--region`       | Provider region                          | `fsn1`         |
-| `--image`        | OS image                                 | `ubuntu-24.04` |
-| `--services`     | Comma-separated services to install      | `docker`       |
-| `--skip-prepare` | Skip host preparation step               | `false`        |
-| `--timeout`      | Timeout in milliseconds                  | `600000`       |
+| Option           | Description                                   | Default        |
+| ---------------- | --------------------------------------------- | -------------- |
+| `--name`         | Host name                                     | auto-generated |
+| `--provider`     | Cloud provider: `hetzner`, `do`, `datacrunch` | `hetzner`      |
+| `--type`         | Instance type                                 | `cax11`        |
+| `--region`       | Provider region                               | `fsn1`         |
+| `--image`        | OS image                                      | `ubuntu-24.04` |
+| `--services`     | Comma-separated services to install           | `docker`       |
+| `--skip-prepare` | Skip host preparation step                    | `false`        |
+| `--timeout`      | Timeout in milliseconds                       | `600000`       |
 
 ### `ddc host provision <id>`
 
@@ -296,15 +296,15 @@ debian-12
 ...
 ```
 
-| Option       | Description                                            | Default |
-| ------------ | ------------------------------------------------------ | ------- |
-| `--provider` | **Required.** Cloud provider: `hetzner`, `do`, `verda` | —       |
-| `--region`   | Filter instance types available in a region            | —       |
-| `--type`     | Show details for a specific instance type              | —       |
-| `--arch`     | Filter by architecture (e.g. `arm64`, `amd64`)         | —       |
-| `--cpu`      | Filter to types with at least N vCPUs                  | —       |
-| `--memory`   | Filter to types with at least N MB of memory           | —       |
-| `--disk`     | Filter to types with at least N GB of disk             | —       |
+| Option       | Description                                                 | Default |
+| ------------ | ----------------------------------------------------------- | ------- |
+| `--provider` | **Required.** Cloud provider: `hetzner`, `do`, `datacrunch` | —       |
+| `--region`   | Filter instance types available in a region                 | —       |
+| `--type`     | Show details for a specific instance type                   | —       |
+| `--arch`     | Filter by architecture (e.g. `arm64`, `amd64`)              | —       |
+| `--cpu`      | Filter to types with at least N vCPUs                       | —       |
+| `--memory`   | Filter to types with at least N MB of memory                | —       |
+| `--disk`     | Filter to types with at least N GB of disk                  | —       |
 
 ### `ddc deploy`
 

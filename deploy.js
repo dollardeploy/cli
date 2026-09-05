@@ -33,15 +33,6 @@ const PROVIDER_DEFAULTS = {
   }
 };
 
-// User-facing provider aliases mapped to the identifier the API expects.
-// "verda" is the current brand for the provider the API still calls "datacrunch".
-const PROVIDER_ALIASES = {
-  verda: "datacrunch"
-};
-
-const normalizeProvider = provider =>
-  provider ? (PROVIDER_ALIASES[provider] ?? provider) : provider;
-
 /** @type {typeof console & { verbose: (...args: any[]) => void }} */
 const logger = {
   ...console,
@@ -179,7 +170,7 @@ const prompt = question =>
   });
 
 const confirm = async question => {
-  if (process.stdin.isTTY) {
+  if (process.env.PS1) {
     const answer = await prompt(`${question} [y/N] `);
     return answer.toLowerCase() === "y" || answer.toLowerCase() === "yes";
   } else {
@@ -205,8 +196,7 @@ const createApiClient = auth => {
 
   const headers = {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${apiKey}`,
-    "User-Agent": "DollarDeploy-CLI/" + packageJson.version
+    Authorization: `Bearer ${apiKey}`
   };
 
   const handleResponse = async response => {
@@ -394,25 +384,23 @@ const waitForTask = async (api, taskId, timeout = DEFAULT_TIMEOUT) => {
   throw new Error(`Task ${taskId} timed out after ${timeout}ms`);
 };
 
-const RETRY_HTTP_ERRORS = [502, 503, 504];
-
-const checkUrl = async (url, maxRetries = 20, retryDelay = 2000) => {
+const checkUrl = async (url, maxRetries = 10, retryDelay = 5000) => {
   logger.verbose(`Checking ${url}...`);
 
   for (let i = 0; i < maxRetries; i++) {
     try {
       const response = await fetch(url, {
         method: "GET",
-        headers: { "User-Agent": "DollarDeploy-CLI/" + packageJson.version },
+        headers: { "User-Agent": "DollarDeploy-CLI/1.0" },
         signal: AbortSignal.timeout(10000)
       });
 
-      if (!RETRY_HTTP_ERRORS.includes(response.status)) {
-        logger.verbose(`URL responding (status: ${response.status})`);
-        return response.status;
+      if (response.ok) {
+        logger.verbose(`URL accessible (status: ${response.status})`);
+        return true;
       }
 
-      logger.verbose(`URL ${url} status ${response.status}, retrying...`);
+      logger.verbose(`Status ${response.status}, retrying...`);
     } catch (error) {
       logger.verbose(`Attempt ${i + 1}/${maxRetries}: ${error.message}`);
     }
@@ -423,18 +411,6 @@ const checkUrl = async (url, maxRetries = 20, retryDelay = 2000) => {
   }
 
   throw new Error(`URL ${url} not accessible after ${maxRetries} attempts`);
-};
-
-// Verify the deployed URL is responding, but never fail the deploy over it —
-// the app is already deployed, so a slow first boot shouldn't report an error.
-const verifyDeployedUrl = async appUrl => {
-  logger.info(`Checking ${appUrl}...`);
-  try {
-    await checkUrl(appUrl);
-    logger.info(`Deployed: ${appUrl}`);
-  } catch (error) {
-    logger.warn(`Deployed, but ${appUrl} is not responding yet: ${error.message}`);
-  }
 };
 
 // ─── Argument parser ─────────────────────────────────────────────────────────
@@ -648,7 +624,7 @@ const cmdSshList = async (api, _positional, flags) => {
 
 const cmdHostCreate = async (api, _positional, flags) => {
   const name = flags.name || undefined;
-  const provider = normalizeProvider(flags.provider);
+  const provider = flags.provider;
   const providerType = flags.type || PROVIDER_DEFAULTS[provider]?.type;
   const providerRegion = flags.region || PROVIDER_DEFAULTS[provider]?.region;
   const image = flags.image || PROVIDER_DEFAULTS[provider]?.image;
@@ -852,7 +828,7 @@ const cmdAppDeploy = async (api, _positional, flags) => {
 
   // Create host if needed
   if (!hostId && flags["create-host"]) {
-    const provider = normalizeProvider(flags.provider) || DEFAULT_PROVIDER;
+    const provider = flags.provider || DEFAULT_PROVIDER;
     const providerType = flags.type || PROVIDER_DEFAULTS[provider]?.type;
     const providerRegion = flags.region || PROVIDER_DEFAULTS[provider]?.region;
     const image = flags.image || PROVIDER_DEFAULTS[provider]?.image;
@@ -893,24 +869,9 @@ const cmdAppDeploy = async (api, _positional, flags) => {
     logger.info("Host ready.");
   }
 
-  // Auto-select the host when none was given and exactly one active host exists.
-  if (!hostId) {
-    const activeHosts = (await api.listHosts("active")).filter(h => h.status === "active");
-    if (activeHosts.length === 1) {
-      hostId = activeHosts[0].id;
-      logger.info(`Using host ${activeHosts[0].name || hostId} (only active host).`);
-    } else if (activeHosts.length > 1) {
-      logger.error(
-        "Multiple active hosts found. Specify one with --hostId <id>:\n" +
-          activeHosts.map(h => `  ${h.id}  ${h.name || ""}`).join("\n")
-      );
-      process.exit(1);
-    }
-  }
-
   if (!hostId) {
     logger.error(
-      "ddc app deploy: no active host found. Use --hostId <id> to deploy to an existing host, or --create-host to provision a new host."
+      "ddc app deploy: use --hostId <id> to deploy to an existing host, or --create-host to provision a new host."
     );
     process.exit(1);
   }
@@ -982,7 +943,9 @@ const cmdAppDeploy = async (api, _positional, flags) => {
     await waitForTask(api, task.id, timeout);
 
     const appUrl = `https://${hostname}`;
-    await verifyDeployedUrl(appUrl);
+    logger.info(`Checking ${appUrl}...`);
+    await checkUrl(appUrl);
+    logger.info(`Deployed: ${appUrl}`);
 
     output({ id: app.id, name: app.name, url: appUrl, status: "deployed" });
   } else if (templateId) {
@@ -1011,7 +974,9 @@ const cmdAppDeploy = async (api, _positional, flags) => {
     }
 
     const appUrl = `https://${hostname}`;
-    await verifyDeployedUrl(appUrl);
+    logger.info(`Checking ${appUrl}...`);
+    await checkUrl(appUrl);
+    logger.info(`Deployed: ${appUrl}`);
 
     output({ id: completedTask.appId, url: appUrl, status: "deployed" });
   }
@@ -1374,7 +1339,7 @@ const cmdHostProvision = async (api, positional, flags) => {
     process.exit(1);
   }
 
-  const provider = normalizeProvider(flags.provider);
+  const provider = flags.provider;
   if (provider) {
     const providerType = flags.type || PROVIDER_DEFAULTS[provider]?.type;
     const providerRegion = flags.region || PROVIDER_DEFAULTS[provider]?.region;
@@ -1495,10 +1460,10 @@ const cmdSshRemove = async (api, positional, flags) => {
 };
 
 const cmdProvision = async (api, _positional, flags) => {
-  const provider = normalizeProvider(flags.provider);
+  const provider = flags.provider;
   if (!provider || flags.help) {
     logger.info(
-      "ddc provision --provider <hetzner|do|verda> [--region <r>] [--type <t>] [--arch <a>] [--cpu <n>] [--memory <mb>] [--disk <gb>]"
+      "ddc provision --provider <hetzner|do|datacrunch> [--region <r>] [--type <t>] [--arch <a>] [--cpu <n>] [--memory <mb>] [--disk <gb>]"
     );
     logger.info(
       "Lists the regions, instance types and images available for a provider, so you know what to pass to `ddc host provision`."
@@ -1575,12 +1540,6 @@ const extractEnvFlags = flags => {
   if (flags.env && flags.env !== true) {
     Object.assign(env, parseEnvValues(flags.env));
   }
-  // --env:NAME value / --env.NAME value format
-  for (const [key, value] of Object.entries(flags)) {
-    if ((key.startsWith("env:") || key.startsWith("env.")) && value !== true) {
-      env[key.slice(4)] = value;
-    }
-  }
   return env;
 };
 
@@ -1654,7 +1613,7 @@ AUTH & USER INFO
 
 HOST CREATE OPTIONS
   --name <name>                 Host name
-  --provider <provider>         Required: Cloud provider: hetzner, do, verda
+  --provider <provider>         Required: Cloud provider: hetzner, do, datacrunch
   --type <type>                 Instance type (default: ${PROVIDER_DEFAULTS["hetzner"]?.type} for Hetzner)
   --region <region>             Provider region (default: ${PROVIDER_DEFAULTS["hetzner"]?.region} for Hetzner)
   --image <image>               OS image (default: ${PROVIDER_DEFAULTS["hetzner"]?.image} for Hetzner)
@@ -1663,7 +1622,7 @@ HOST CREATE OPTIONS
   --timeout <ms>                Timeout in ms (default: 10 minutes)
 
 HOST PROVISION OPTIONS
-  --provider <provider>         Provider to save before provisioning (hetzner, do, verda)
+  --provider <provider>         Provider to save before provisioning (hetzner, do, datacrunch)
   --type <type>                 Instance type (uses provider default if omitted)
   --region <region>             Provider region (uses provider default if omitted)
   --image <image>               OS image (uses provider default if omitted)
@@ -1671,7 +1630,7 @@ HOST PROVISION OPTIONS
   Tip: run \`ddc provision --provider <p>\` to see valid types/regions/images.
 
 PROVISION OPTIONS (ddc provision — list available options for a provider)
-  --provider <provider>         Required: hetzner, do, verda
+  --provider <provider>         Required: hetzner, do, datacrunch
   --region <region>             Filter instance types available in a region
   --type <type>                 Show details for a specific instance type
   --arch <arch>                 Filter by architecture (e.g. arm64, amd64)
@@ -1851,9 +1810,9 @@ const main = async () => {
     Object.assign(auth, findAuth(auth.baseUrl));
   }
 
-  const api = createApiClient(auth);
-
   try {
+    const api = createApiClient(auth);
+
     if (command === "user") {
       await cmdUser(api);
     } else if (command === "host") {
