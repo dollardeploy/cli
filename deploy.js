@@ -1851,9 +1851,9 @@ const main = async () => {
     Object.assign(auth, findAuth(auth.baseUrl));
   }
 
-  const api = createApiClient(auth);
-
   try {
+    const api = createApiClient(auth);
+
     if (command === "user") {
       await cmdUser(api);
     } else if (command === "host") {
