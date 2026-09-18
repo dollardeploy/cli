@@ -341,7 +341,13 @@ const createApiClient = auth => {
     removeApp: (id, options = { deleteApp: false }) => post(`/api/app/${id}/remove`, options),
     listSshKeys: () => get("/api/settings/privateKey"),
     createSshKey: data => post("/api/settings/privateKey/create", data),
-    deleteSshKey: id => del(`/api/settings/privateKey/${id}`)
+    deleteSshKey: id => del(`/api/settings/privateKey/${id}`),
+    listCrons: query => get(`/api/cron${query ? "?" + query : ""}`),
+    getCron: id => get(`/api/cron/${id}`),
+    createCron: data => post("/api/cron", data),
+    updateCron: (id, data) => patch(`/api/cron/${id}`, data),
+    deleteCron: id => del(`/api/cron/${id}`),
+    runCron: id => post(`/api/cron/${id}/run`, {})
   };
 };
 
@@ -1594,6 +1600,142 @@ const extractAppFlags = flags => {
   return props;
 };
 
+// ─── Cron ────────────────────────────────────────────────────────────────────
+
+// Collect a cron create/update payload from CLI flags. On update, the target
+// (appId/hostId) cannot change and is dropped.
+const collectCronPayload = (flags, isUpdate = false) => {
+  const p = {};
+  if (flags.appId || flags.app) {
+    p.appId = flags.appId || flags.app;
+  }
+  if (flags.hostId || flags.host) {
+    p.hostId = flags.hostId || flags.host;
+  }
+  if (flags.name !== undefined) {
+    p.name = flags.name;
+  }
+  if (flags.type) {
+    p.type = flags.type;
+  }
+  if (flags.schedule) {
+    p.schedule = flags.schedule;
+  }
+  if (flags.timezone || flags.tz) {
+    p.timezone = flags.timezone || flags.tz;
+  }
+  if (flags.path) {
+    p.path = flags.path;
+  }
+  if (flags.method) {
+    p.method = flags.method;
+  }
+  if (flags.authFrom || flags.secret) {
+    p.authFrom = flags.authFrom || flags.secret;
+  }
+  if (flags.command || flags.cmd) {
+    p.command = flags.command || flags.cmd;
+  }
+  if (flags.retries !== undefined) {
+    p.retries = Number(flags.retries);
+  }
+  if (flags.disabled) {
+    p.enabled = false;
+  } else if (flags.enabled !== undefined) {
+    p.enabled = flags.enabled === true || flags.enabled === "true";
+  }
+  if (flags.alert !== undefined) {
+    p.alertType = flags.alert ? String(flags.alert).split(",") : [];
+  }
+  if (isUpdate) {
+    delete p.appId;
+    delete p.hostId;
+  }
+  return p;
+};
+
+const cmdCron = async (api, positional, flags) => {
+  const sub = positional[0];
+  const rest = positional.slice(1);
+
+  if (sub === "list" || sub === "ls") {
+    const params = [];
+    if (flags.appId || flags.app) {
+      params.push(`appId=${flags.appId || flags.app}`);
+    }
+    if (flags.hostId || flags.host) {
+      params.push(`hostId=${flags.hostId || flags.host}`);
+    }
+    const crons = await api.listCrons(params.join("&"));
+    output(
+      crons.map(c => ({
+        id: c.id,
+        name: c.name || "",
+        type: c.type,
+        schedule: c.schedule,
+        timezone: c.timezone || "UTC",
+        enabled: c.enabled,
+        lastStatus: c.lastStatus || "",
+        nextRunAt: c.nextRunAt || ""
+      }))
+    );
+    return;
+  }
+
+  if (sub === "get") {
+    const id = rest[0] || flags.id;
+    if (!id) {
+      throw new Error("Usage: ddc cron get <cron-id>");
+    }
+    output(await api.getCron(id));
+    return;
+  }
+
+  if (sub === "create") {
+    const data = collectCronPayload(flags);
+    const cron = await api.createCron(data);
+    logger.info(`Cron created: ${cron.id}`);
+    output(cron);
+    return;
+  }
+
+  if (sub === "update" || sub === "modify") {
+    const id = rest[0] || flags.id;
+    if (!id) {
+      throw new Error("Usage: ddc cron update <cron-id> [flags]");
+    }
+    const data = collectCronPayload(flags, true);
+    const cron = await api.updateCron(id, data);
+    logger.info(`Cron updated: ${cron.id}`);
+    output(cron);
+    return;
+  }
+
+  if (sub === "delete" || sub === "rm" || sub === "remove") {
+    const id = rest[0] || flags.id;
+    if (!id) {
+      throw new Error("Usage: ddc cron delete <cron-id>");
+    }
+    await api.deleteCron(id);
+    logger.info(`Cron deleted: ${id}`);
+    return;
+  }
+
+  if (sub === "run") {
+    const id = rest[0] || flags.id;
+    if (!id) {
+      throw new Error("Usage: ddc cron run <cron-id>");
+    }
+    const task = await api.runCron(id);
+    logger.info(`Cron run queued: ${task.id}`);
+    output(task);
+    return;
+  }
+
+  logger.error("ddc cron <list|get|create|update|delete|run>");
+  process.exit(1);
+};
+
 // ─── Help ────────────────────────────────────────────────────────────────────
 
 const showHelp = () => {
@@ -1634,6 +1776,12 @@ COMMANDS
   task list                     List tasks (--status to filter)
   task get <id>                 Show a task
   task cancel <id>              Cancel a running task
+  cron list                     List crons (--app <id> / --host <id>)
+  cron get <id>                 Show a cron
+  cron create                   Create a cron (--app/--host --type --schedule ...)
+  cron update <id>              Update a cron (--schedule, --enabled, --disabled, ...)
+  cron delete <id>              Delete a cron
+  cron run <id>                 Run a cron now
   logs                          Show journal logs (--task/--app/--host/--follow)
   provision                     List available regions/types/images for a provider
   version                       Show CLI version
@@ -1926,13 +2074,15 @@ const main = async () => {
       }
     } else if (command === "task") {
       await cmdTask(api, positional.slice(1), flags);
+    } else if (command === "cron") {
+      await cmdCron(api, positional.slice(1), flags);
     } else if (command === "logs") {
       await cmdLogs(api, positional.slice(1), flags);
     } else if (command === "provision") {
       await cmdProvision(api, positional.slice(1), flags);
     } else {
       logger.info(
-        `ddc <auth|user|host|app|deploy|build|ssh|template|task|logs|provision|version|help>`
+        `ddc <auth|user|host|app|deploy|build|ssh|template|task|cron|logs|provision|version|help>`
       );
       process.exit(1);
     }
