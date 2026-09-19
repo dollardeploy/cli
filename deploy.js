@@ -576,9 +576,18 @@ const readLocalEnv = dir => {
   return { values, sources, placeholders };
 };
 
-// Never print env values to the terminal or scrollback (they may be secrets).
-// Only key names are shown; values are always masked in the overview.
-const maskEnvValue = value => (value === undefined || value === "" ? "<empty>" : "********");
+// Max number of env var names to list in the overview before summarizing the
+// rest as "+ N more". Values are never printed (they may be secrets).
+const MAX_ENV_PREVIEW = 5;
+
+// Render a compact, capped list of names, e.g. "A, B, C, D, E + 3 more".
+const formatNameList = names => {
+  if (names.length <= MAX_ENV_PREVIEW) {
+    return names.join(", ");
+  }
+  const shown = names.slice(0, MAX_ENV_PREVIEW).join(", ");
+  return `${shown} + ${names.length - MAX_ENV_PREVIEW} more`;
+};
 
 // Read-only preview of which host a local deploy will target, for the overview.
 const resolveHostLabel = async (api, hostId, flags) => {
@@ -608,9 +617,9 @@ const printDeployOverview = ({
   ahead,
   hostLabel,
   values,
-  sources,
+  cliEnv,
   placeholders,
-  cliEnv
+  appExisted
 }) => {
   logger.info("");
   logger.info("Deploy overview");
@@ -631,22 +640,26 @@ const printDeployOverview = ({
     );
   }
 
+  // When the app already exists, its configuration is left untouched - a local
+  // deploy only triggers a new build+deploy, so do not list env we won't apply.
+  if (appExisted) {
+    logger.info("  App already exists - its settings and env will not be changed.");
+    logger.info("  This will trigger a redeploy of the existing app.");
+    logger.info("");
+    return;
+  }
+
   const envKeys = Array.from(new Set([...Object.keys(values), ...Object.keys(cliEnv)])).sort();
   if (envKeys.length > 0) {
-    logger.info("  Environment variables (values hidden):");
-    for (const key of envKeys) {
-      const fromCli = cliEnv[key] !== undefined;
-      const source = fromCli ? "--env" : sources[key] || "local";
-      const value = fromCli ? cliEnv[key] : values[key];
-      logger.info(`    ${key} = ${maskEnvValue(value)} (${source})`);
-    }
+    logger.info(
+      `  Environment variables (${envKeys.length}, values hidden): ${formatNameList(envKeys)}`
+    );
   }
 
   if (placeholders.length > 0) {
-    logger.info("  Needs a value at dollardeploy.com (from .env.example):");
-    for (const key of placeholders) {
-      logger.info(`    ${key}`);
-    }
+    logger.info(
+      `  Needs a value at dollardeploy.com (from .env.example): ${formatNameList(placeholders)}`
+    );
   }
   logger.info("");
 };
@@ -1033,11 +1046,11 @@ const cmdAppDeploy = async (api, _positional, flags) => {
   // With no --url/--template/--appId, detect the git repo in the current folder
   // (Vercel-style): read the remote URL, branch, dirty state and local env files.
   let localEnv = {};
-  let localSources = {};
   let localPlaceholders = [];
   let sourceBranch = flags.sourceBranch;
   let gitInfo = null;
   let fromLocal = false;
+  let appExisted = false;
 
   if (!url && !templateId && !appId) {
     const projectDir = flags.path || process.cwd();
@@ -1056,7 +1069,6 @@ const cmdAppDeploy = async (api, _positional, flags) => {
     }
     const local = readLocalEnv(projectDir);
     localEnv = local.values;
-    localSources = local.sources;
     localPlaceholders = local.placeholders;
   }
 
@@ -1074,6 +1086,7 @@ const cmdAppDeploy = async (api, _positional, flags) => {
     if (existing) {
       logger.info(`Existing appId ${existing.id} name ${existing.name}`);
       appId = existing.id;
+      appExisted = true;
     }
   }
 
@@ -1100,13 +1113,16 @@ const cmdAppDeploy = async (api, _positional, flags) => {
       ahead: gitInfo.ahead,
       hostLabel,
       values: localEnv,
-      sources: localSources,
       placeholders: localPlaceholders,
-      cliEnv: extractEnvFlags(flags)
+      cliEnv: extractEnvFlags(flags),
+      appExisted
     });
 
     if (!flags.yes) {
-      const ok = await confirm("Proceed with this deploy?");
+      const prompt = appExisted
+        ? "Trigger a deploy of the existing app?"
+        : "Proceed with this deploy?";
+      const ok = await confirm(prompt);
       if (!ok) {
         logger.info("Aborted.");
         return;
@@ -1120,11 +1136,14 @@ const cmdAppDeploy = async (api, _positional, flags) => {
     const app = await api.getApp(appId);
     logger.verbose(`App: ${app.name} on host ${app.hostId}`);
 
-    // Apply local env files, --env and --set overrides. Local placeholders are
-    // skipped on redeploy so they never blank existing values.
-    const envOverrides = { ...localEnv, ...extractEnvFlags(flags) };
+    // If the app already existed (matched by repo URL during a local deploy),
+    // leave its configuration untouched - a bare deploy only triggers a new
+    // build+deploy. Auto-detected local env and branch are NOT applied; only
+    // explicit --env/--set/prop flags the user typed are honored.
+    const autoEnv = appExisted ? {} : localEnv;
+    const envOverrides = { ...autoEnv, ...extractEnvFlags(flags) };
     const propOverrides = extractAppFlags(flags);
-    if (sourceBranch && propOverrides.sourceBranch === undefined) {
+    if (!appExisted && sourceBranch && propOverrides.sourceBranch === undefined) {
       propOverrides.sourceBranch = sourceBranch;
     }
     if (Object.keys(envOverrides).length > 0 || Object.keys(propOverrides).length > 0) {
@@ -2030,7 +2049,10 @@ APP DEPLOY OPTIONS
                                 .env.production/.env.prod/.env.local and treats
                                 .env.example keys as placeholders to fill at
                                 dollardeploy.com, then shows a confirmation
-                                overview before deploying (env values hidden).
+                                overview before deploying (env values hidden,
+                                names capped at 5 with "+ N more"). If the app
+                                already exists it is left untouched and you are
+                                only asked to trigger a redeploy.
   --path <dir>                  Folder to deploy (default: current directory)
   --yes                         Skip the local-deploy confirmation prompt
   --url <github-url>            Deploy from a GitHub repository

@@ -346,7 +346,8 @@ Run `ddc deploy` with no `--url`, `--template`, or `--appId` inside a git reposi
 - **Uses the current branch** as the deploy source branch (override with `--sourceBranch`).
 - **Warns if the working tree is dirty** or has commits that are not pushed - the deploy builds from the remote, so only committed and pushed work ships.
 - **Reads environment variables** from the first match of `.env.production`, `.env.prod`, `.env.production.local`, `.env.local`. Keys found only in `.env.example` become empty placeholders to fill in at dollardeploy.com.
-- **Shows a confirmation overview** (repository, branch, target host, env variable names with values hidden, and placeholders that still need values), then asks you to confirm. Values are never printed to the terminal. Use `--yes` to skip the prompt (required in non-interactive/CI environments), and `--path <dir>` to deploy a different folder.
+- **Shows a confirmation overview** (repository, branch, target host, env variable names with values hidden, and placeholders that still need values), then asks you to confirm. Values are never printed to the terminal, and the env name list is capped at 5 names with a `+ N more` summary. Use `--yes` to skip the prompt (required in non-interactive/CI environments), and `--path <dir>` to deploy a different folder.
+- **App already exists?** If the repository matches an existing app, its settings and env are left untouched - you are only asked to trigger a redeploy of the existing app.
 - **No server yet?** If no active host exists, it creates an app entry with no server selected and prints a link to pick one at dollardeploy.com.
 
 ```bash
