@@ -7,7 +7,6 @@
 const fs = require("fs");
 const path = require("path");
 const readline = require("readline");
-const { execFileSync } = require("child_process");
 const packageJson = require("./package.json");
 
 const DEFAULT_PROVIDER = "hetzner";
@@ -284,7 +283,6 @@ const createApiClient = auth => {
   };
 
   return {
-    baseUrl,
     createHost: name => post("/api/host/create", { name }),
     getHost: id => get(`/api/host/${id}`),
     listHosts: status => get(`/api/host${status ? `?status=${status}` : ""}`),
@@ -437,231 +435,6 @@ const verifyDeployedUrl = async appUrl => {
   } catch (error) {
     logger.warn(`Deployed, but ${appUrl} is not responding yet: ${error.message}`);
   }
-};
-
-// ─── Local folder detection (git + env files) ────────────────────────────────
-
-// Run a git command in `dir` and return trimmed stdout, or "" on any failure
-// (not a repo, git missing, no remote). git errors are swallowed on purpose so
-// detection degrades gracefully into a clear CLI message.
-const runGit = (dir, args) => {
-  try {
-    return execFileSync("git", args, {
-      cwd: dir,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
-    }).trim();
-  } catch {
-    return "";
-  }
-};
-
-// Normalize any git remote URL to a plain https GitHub-style URL:
-//   git@github.com:org/repo.git       -> https://github.com/org/repo
-//   ssh://git@github.com/org/repo.git -> https://github.com/org/repo
-//   https://user:token@github.com/... -> https://github.com/...
-const normalizeRepoUrl = raw => {
-  if (!raw) {
-    return undefined;
-  }
-  let url = raw.trim();
-  const scpMatch = url.match(/^git@([^:]+):(.+)$/);
-  if (scpMatch) {
-    url = `https://${scpMatch[1]}/${scpMatch[2]}`;
-  }
-  url = url.replace(/^ssh:\/\/git@/, "https://").replace(/^git\+https:\/\//, "https://");
-  url = url.replace(/^(https?:\/\/)[^@/]+@/, "$1");
-  url = url.replace(/\/+$/, "").replace(/\.git$/, "");
-  return url;
-};
-
-// Detect the git repository in `dir`: normalized remote URL, current branch,
-// list of uncommitted changes, and count of commits not pushed upstream.
-// Returns null when `dir` is not inside a git work tree.
-const getGitInfo = dir => {
-  if (runGit(dir, ["rev-parse", "--is-inside-work-tree"]) !== "true") {
-    return null;
-  }
-
-  const branch = runGit(dir, ["rev-parse", "--abbrev-ref", "HEAD"]) || undefined;
-
-  let rawUrl = runGit(dir, ["remote", "get-url", "origin"]);
-  if (!rawUrl) {
-    const firstRemote = runGit(dir, ["remote"]).split("\n").filter(Boolean)[0];
-    if (firstRemote) {
-      rawUrl = runGit(dir, ["remote", "get-url", firstRemote]);
-    }
-  }
-
-  const status = runGit(dir, ["status", "--porcelain"]);
-  const dirty = status ? status.split("\n").filter(Boolean) : [];
-
-  const aheadRaw = runGit(dir, ["rev-list", "--count", "@{u}..HEAD"]);
-  const ahead = /^\d+$/.test(aheadRaw) ? parseInt(aheadRaw, 10) : 0;
-
-  return { repoUrl: normalizeRepoUrl(rawUrl), branch, dirty, ahead };
-};
-
-// Parse KEY=VALUE lines from a .env file body. Ignores blanks and comments,
-// tolerates a leading `export `, and strips matching surrounding quotes.
-const parseEnvFile = content => {
-  const env = {};
-  for (const line of content.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) {
-      continue;
-    }
-    const body = trimmed.startsWith("export ") ? trimmed.slice(7).trim() : trimmed;
-    const eqIndex = body.indexOf("=");
-    if (eqIndex === -1) {
-      continue;
-    }
-    const key = body.slice(0, eqIndex).trim();
-    if (!key) {
-      continue;
-    }
-    let value = body.slice(eqIndex + 1).trim();
-    if (
-      value.length >= 2 &&
-      ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'")))
-    ) {
-      value = value.slice(1, -1);
-    }
-    env[key] = value;
-  }
-  return env;
-};
-
-// Real env files are read in priority order (first match wins per key). Keys
-// present only in .env.example (or empty everywhere) become placeholders the
-// user must fill at dollardeploy.com.
-const LOCAL_ENV_FILES = [
-  ".env.production",
-  ".env.prod",
-  ".env.production.local",
-  ".env.local"
-];
-
-const readLocalEnv = dir => {
-  const values = {};
-  const sources = {};
-
-  for (const file of LOCAL_ENV_FILES) {
-    const full = path.join(dir, file);
-    if (!fs.existsSync(full)) {
-      continue;
-    }
-    const parsed = parseEnvFile(fs.readFileSync(full, "utf8"));
-    for (const [key, value] of Object.entries(parsed)) {
-      if (value === "" || values[key] !== undefined) {
-        continue;
-      }
-      values[key] = value;
-      sources[key] = file;
-    }
-  }
-
-  const placeholders = [];
-  const examplePath = path.join(dir, ".env.example");
-  if (fs.existsSync(examplePath)) {
-    const example = parseEnvFile(fs.readFileSync(examplePath, "utf8"));
-    for (const key of Object.keys(example)) {
-      if (values[key] === undefined) {
-        placeholders.push(key);
-      }
-    }
-  }
-
-  return { values, sources, placeholders };
-};
-
-// Max number of env var names to list in the overview before summarizing the
-// rest as "+ N more". Values are never printed (they may be secrets).
-const MAX_ENV_PREVIEW = 5;
-
-// Render a compact, capped list of names, e.g. "A, B, C, D, E + 3 more".
-const formatNameList = names => {
-  if (names.length <= MAX_ENV_PREVIEW) {
-    return names.join(", ");
-  }
-  const shown = names.slice(0, MAX_ENV_PREVIEW).join(", ");
-  return `${shown} + ${names.length - MAX_ENV_PREVIEW} more`;
-};
-
-// Read-only preview of which host a local deploy will target, for the overview.
-const resolveHostLabel = async (api, hostId, flags) => {
-  if (hostId) {
-    const host = await api.getHost(hostId).catch(() => null);
-    return host ? host.name || host.id : hostId;
-  }
-  if (flags["create-host"]) {
-    const provider = normalizeProvider(flags.provider) || DEFAULT_PROVIDER;
-    return `new ${provider} host (will be provisioned)`;
-  }
-  const activeHosts = (await api.listHosts("active")).filter(h => h.status === "active");
-  if (activeHosts.length === 1) {
-    return `${activeHosts[0].name || activeHosts[0].id} (only active host)`;
-  }
-  if (activeHosts.length > 1) {
-    return "multiple active hosts - pick one with --hostId <id>";
-  }
-  return "none - an app entry will be created, select a server at dollardeploy.com";
-};
-
-// Print the "what will be deployed" summary shown before a local-folder deploy.
-const printDeployOverview = ({
-  repoUrl,
-  branch,
-  dirty,
-  ahead,
-  hostLabel,
-  values,
-  cliEnv,
-  placeholders,
-  appExisted
-}) => {
-  logger.info("");
-  logger.info("Deploy overview");
-  logger.info(`  Repository:  ${repoUrl}`);
-  if (branch) {
-    logger.info(`  Branch:      ${branch}`);
-  }
-  logger.info(`  Target host: ${hostLabel}`);
-
-  if (dirty.length > 0) {
-    logger.warn(
-      `  Warning: ${dirty.length} uncommitted change(s) - the deploy builds from the remote, so uncommitted edits will not ship until committed and pushed.`
-    );
-  }
-  if (ahead > 0) {
-    logger.warn(
-      `  Warning: ${ahead} commit(s) not pushed to the remote - they will not be included in this deploy.`
-    );
-  }
-
-  // When the app already exists, its configuration is left untouched - a local
-  // deploy only triggers a new build+deploy, so do not list env we won't apply.
-  if (appExisted) {
-    logger.info("  App already exists - its settings and env will not be changed.");
-    logger.info("  This will trigger a redeploy of the existing app.");
-    logger.info("");
-    return;
-  }
-
-  const envKeys = Array.from(new Set([...Object.keys(values), ...Object.keys(cliEnv)])).sort();
-  if (envKeys.length > 0) {
-    logger.info(
-      `  Environment variables (${envKeys.length}, values hidden): ${formatNameList(envKeys)}`
-    );
-  }
-
-  if (placeholders.length > 0) {
-    logger.info(
-      `  Needs a value at dollardeploy.com (from .env.example): ${formatNameList(placeholders)}`
-    );
-  }
-  logger.info("");
 };
 
 // ─── Argument parser ─────────────────────────────────────────────────────────
@@ -1025,59 +798,19 @@ const cmdHostPrepare = async (api, positional, flags) => {
 
 const cmdAppDeploy = async (api, _positional, flags) => {
   const timeout = parseInt(flags.timeout) || DEFAULT_TIMEOUT;
-  let url = flags.url;
+  const url = flags.url;
   const templateId = flags.template || flags.templateId;
   const help = flags.help;
   let appId = flags.appId;
   let hostId = flags.hostId;
 
-  if (help) {
-    logger.info(
-      "ddc app deploy [--url <github-url> | --template <id> | --appId <id>] [--hostId <id>] [--env NAME=VALUE ...]\n" +
-        "  With no --url/--template/--appId, deploys the git repo in the current folder\n" +
-        "  (detects the remote URL, reads .env.production/.env.prod/.env.local and\n" +
-        "  .env.example placeholders, shows a confirmation overview, then deploys).\n" +
-        "  --path <dir>  deploy a different folder   --yes  skip the confirmation prompt"
+  if ((!url && !templateId && !appId) || help) {
+    logger.error(
+      "ddc app deploy: to deploy new apps, use --url <github-url>, --template <id>, or --appId <id> to redeploy existing."
     );
-    process.exit(0);
+    process.exit(1);
   }
 
-  // ─── Local-folder-aware deploy ─────────────────────────────────────────────
-  // With no --url/--template/--appId, detect the git repo in the current folder
-  // (Vercel-style): read the remote URL, branch, dirty state and local env files.
-  let localEnv = {};
-  let localPlaceholders = [];
-  let sourceBranch = flags.sourceBranch;
-  let gitInfo = null;
-  let fromLocal = false;
-  let appExisted = false;
-
-  if (!url && !templateId && !appId) {
-    const projectDir = flags.path || process.cwd();
-    gitInfo = getGitInfo(projectDir);
-    if (!gitInfo || !gitInfo.repoUrl) {
-      logger.error(
-        `ddc app deploy: no git repository with a remote found in ${projectDir}.\n` +
-          "Run this inside a git repo, or pass --url <github-url>, --template <id>, or --appId <id>."
-      );
-      process.exit(1);
-    }
-    fromLocal = true;
-    url = gitInfo.repoUrl;
-    if (!sourceBranch) {
-      sourceBranch = gitInfo.branch;
-    }
-    const local = readLocalEnv(projectDir);
-    localEnv = local.values;
-    localPlaceholders = local.placeholders;
-  }
-
-  // Derive a default app name from the repo URL when none was provided.
-  const repoName = url ? url.split("/").pop() : undefined;
-  const appName = flags.name || templateId || repoName;
-
-  // Resolve an existing app by repository URL so we redeploy instead of
-  // creating a duplicate.
   if (url) {
     const apps = await api.listApps();
     const existing = apps.find(
@@ -1086,47 +819,6 @@ const cmdAppDeploy = async (api, _positional, flags) => {
     if (existing) {
       logger.info(`Existing appId ${existing.id} name ${existing.name}`);
       appId = existing.id;
-      appExisted = true;
-    }
-  }
-
-  // Confirmation overview (Vercel-style) for local-folder deploys.
-  if (fromLocal) {
-    let hostLabel;
-    if (appId) {
-      const existingApp = await api.getApp(appId);
-      if (existingApp.hostId) {
-        const existingHost = await api.getHost(existingApp.hostId).catch(() => null);
-        hostLabel = `${existingHost?.name || existingApp.hostId} (redeploy existing app)`;
-      } else {
-        hostLabel =
-          "none - app has no server yet, select one at dollardeploy.com (redeploy existing app)";
-      }
-    } else {
-      hostLabel = await resolveHostLabel(api, hostId, flags);
-    }
-
-    printDeployOverview({
-      repoUrl: url,
-      branch: sourceBranch,
-      dirty: gitInfo.dirty,
-      ahead: gitInfo.ahead,
-      hostLabel,
-      values: localEnv,
-      placeholders: localPlaceholders,
-      cliEnv: extractEnvFlags(flags),
-      appExisted
-    });
-
-    if (!flags.yes) {
-      const prompt = appExisted
-        ? "Trigger a deploy of the existing app?"
-        : "Proceed with this deploy?";
-      const ok = await confirm(prompt);
-      if (!ok) {
-        logger.info("Aborted.");
-        return;
-      }
     }
   }
 
@@ -1136,16 +828,9 @@ const cmdAppDeploy = async (api, _positional, flags) => {
     const app = await api.getApp(appId);
     logger.verbose(`App: ${app.name} on host ${app.hostId}`);
 
-    // If the app already existed (matched by repo URL during a local deploy),
-    // leave its configuration untouched - a bare deploy only triggers a new
-    // build+deploy. Auto-detected local env and branch are NOT applied; only
-    // explicit --env/--set/prop flags the user typed are honored.
-    const autoEnv = appExisted ? {} : localEnv;
-    const envOverrides = { ...autoEnv, ...extractEnvFlags(flags) };
+    // Apply any --env or --set overrides
+    const envOverrides = extractEnvFlags(flags);
     const propOverrides = extractAppFlags(flags);
-    if (!appExisted && sourceBranch && propOverrides.sourceBranch === undefined) {
-      propOverrides.sourceBranch = sourceBranch;
-    }
     if (Object.keys(envOverrides).length > 0 || Object.keys(propOverrides).length > 0) {
       logger.info(`Updating app ${appId} with env and prop overrides...`);
       await api.updateApp(appId, {
@@ -1223,30 +908,6 @@ const cmdAppDeploy = async (api, _positional, flags) => {
     }
   }
 
-  // No host available: for a repo deploy, create an app entry with no server
-  // selected so the user can pick one at dollardeploy.com, then exit cleanly.
-  if (!hostId && url) {
-    const envOverrides = { ...localEnv, ...extractEnvFlags(flags) };
-    const propOverrides = extractAppFlags(flags);
-    if (sourceBranch && propOverrides.sourceBranch === undefined) {
-      propOverrides.sourceBranch = sourceBranch;
-    }
-    const placeholderEnv = Object.fromEntries(localPlaceholders.map(key => [key, ""]));
-
-    const app = await api.createApp({
-      repositoryUrl: url,
-      name: appName,
-      ...propOverrides,
-      env: { ...placeholderEnv, ...envOverrides }
-    });
-
-    const appLink = `${api.baseUrl}/app/${app.id}`;
-    logger.info("No active host found - created an app entry with no server selected.");
-    logger.info(`Select a server to deploy it: ${appLink}`);
-    output({ id: app.id, name: app.name, status: app.status, url: appLink });
-    return;
-  }
-
   if (!hostId) {
     logger.error(
       "ddc app deploy: no active host found. Use --hostId <id> to deploy to an existing host, or --create-host to provision a new host."
@@ -1264,6 +925,8 @@ const cmdAppDeploy = async (api, _positional, flags) => {
   const wildcard = host.hostnames.find(
     h => h.endsWith(".dollardeploy.app") || h.endsWith(".dollardeploy.dev")
   );
+
+  const appName = flags.name || templateId;
 
   if (wildcard && appName) {
     hostname = appName + "." + wildcard.split(".").slice(1).join(".");
@@ -1297,14 +960,8 @@ const cmdAppDeploy = async (api, _positional, flags) => {
       `AI suggestions: ${suggestions.map(s => `${s.property}: ${JSON.stringify(s.value ?? s.values)}`).join(", ")}`
     );
 
-    const envOverrides = { ...localEnv, ...extractEnvFlags(flags) };
+    const envOverrides = extractEnvFlags(flags);
     const propOverrides = extractAppFlags(flags);
-    if (sourceBranch && propOverrides.sourceBranch === undefined) {
-      propOverrides.sourceBranch = sourceBranch;
-    }
-    // .env.example keys become empty placeholders to fill at dollardeploy.com,
-    // but never override an AI suggestion or a real local/CLI value.
-    const placeholderEnv = Object.fromEntries(localPlaceholders.map(key => [key, ""]));
 
     app = await api.updateApp(app.id, {
       ...Object.fromEntries(
@@ -1312,7 +969,6 @@ const cmdAppDeploy = async (api, _positional, flags) => {
       ),
       ...propOverrides,
       env: {
-        ...placeholderEnv,
         ...Object.assign(
           {},
           ...suggestions.filter(s => s.property === "env").map(s => s.values)
@@ -1965,7 +1621,6 @@ COMMANDS
   app get <id>                  Show a single app
   app create                    Create a new app (see below for options)
   app modify <id>               Modify an existing app
-  app deploy                    Deploy the git repo in the current folder
   app deploy --url <url>        Deploy new app from GitHub to a host
   app deploy --template <id>    Deploy template to a host
   app deploy --appId <id>       Redeploy existing app
@@ -2043,25 +1698,12 @@ LOGS OPTIONS
   --follow, -f                  Continuously poll for new logs
 
 APP DEPLOY OPTIONS
-  (no url/template/appId)       Deploy the git repo in the current folder:
-                                detects the remote URL and branch, warns on
-                                uncommitted/unpushed changes, reads env from
-                                .env.production/.env.prod/.env.local and treats
-                                .env.example keys as placeholders to fill at
-                                dollardeploy.com, then shows a confirmation
-                                overview before deploying (env values hidden,
-                                names capped at 5 with "+ N more"). If the app
-                                already exists it is left untouched and you are
-                                only asked to trigger a redeploy.
-  --path <dir>                  Folder to deploy (default: current directory)
-  --yes                         Skip the local-deploy confirmation prompt
   --url <github-url>            Deploy from a GitHub repository
   --template <id>               Deploy from a template
   --appId <id>                  Redeploy an existing app
   --hostId <id>                 Deploy to an existing host ID
   --create-host                 Create a new host for deployment
   --name <name>                 App name
-  --sourceBranch <branch>       Branch to deploy from (default: current branch)
   --env NAME=VALUE              Set environment variable (can be specified multiple times)
   --set:<key> <value>           Set app property
   --provider <provider>         Provider for --create-host (default: hetzner)
@@ -2121,12 +1763,6 @@ EXAMPLES
 
   # Modify an existing app
   ddc app modify <app-id> --name new-name --env API_KEY=secret
-
-  # Deploy the git repo in the current folder (detects repo, env, shows overview)
-  ddc deploy
-
-  # Deploy the current folder without the confirmation prompt (CI-friendly)
-  ddc deploy --yes
 
   # Deploy from GitHub to an existing host
   ddc app deploy --url https://github.com/org/repo --hostId <host-id>

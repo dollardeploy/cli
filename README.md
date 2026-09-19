@@ -42,9 +42,6 @@ Your API key is saved to `~/.dollardeploy/auth` and can be overridden with the `
 ### 3. Deploy
 
 ```bash
-# Deploy the git repo in the current folder (detects repo, env, shows overview)
-ddc deploy
-
 # Deploy from GitHub to an existing host
 ddc deploy --url https://github.com/your-org/your-app --hostId <host-id>
 
@@ -316,9 +313,6 @@ Deploy an application to a host. Supports GitHub repos, templates, and redeploym
 Also available as `ddc app deploy`.
 
 ```bash
-# Deploy the git repo in the current folder (no arguments)
-ddc deploy
-
 # Deploy from GitHub (will redeploy existing app if URL matches)
 ddc deploy --url https://github.com/org/repo --hostId <host-id>
 
@@ -338,47 +332,23 @@ ddc deploy --url https://github.com/org/repo --hostId <host-id> --env:DATABASE_U
 ddc deploy --url https://github.com/org/repo --hostId <host-id> --set:mainPort 8080
 ```
 
-#### Local-folder deploys
-
-Run `ddc deploy` with no `--url`, `--template`, or `--appId` inside a git repository and it deploys the current folder, Vercel-style:
-
-- **Detects the repository** from the `origin` remote (falling back to the first remote) and normalizes it to an `https://github.com/org/repo` URL.
-- **Uses the current branch** as the deploy source branch (override with `--sourceBranch`).
-- **Warns if the working tree is dirty** or has commits that are not pushed - the deploy builds from the remote, so only committed and pushed work ships.
-- **Reads environment variables** from the first match of `.env.production`, `.env.prod`, `.env.production.local`, `.env.local`. Keys found only in `.env.example` become empty placeholders to fill in at dollardeploy.com.
-- **Shows a confirmation overview** (repository, branch, target host, env variable names with values hidden, and placeholders that still need values), then asks you to confirm. Values are never printed to the terminal, and the env name list is capped at 5 names with a `+ N more` summary. Use `--yes` to skip the prompt (required in non-interactive/CI environments), and `--path <dir>` to deploy a different folder.
-- **App already exists?** If the repository matches an existing app, its settings and env are left untouched - you are only asked to trigger a redeploy of the existing app.
-- **No server yet?** If no active host exists, it creates an app entry with no server selected and prints a link to pick one at dollardeploy.com.
-
-```bash
-# Deploy the current folder, skip the confirmation (CI)
-ddc deploy --yes
-
-# Deploy a specific folder on a chosen host
-ddc deploy --path ./services/api --hostId <host-id>
-```
-
 The deploy command is smart about redeployment — if you deploy the same GitHub URL to the same host, it will detect the existing app and redeploy it instead of creating a duplicate.
 
-| Option             | Description                                                          |
-| ------------------ | ------------------------------------------------------------------- |
-| (no url/template)  | Deploy the git repo in the current folder                           |
-| `--path`           | Folder to deploy (default: current directory)                       |
-| `--yes`            | Skip the local-deploy confirmation prompt                           |
-| `--url`            | GitHub repository URL                                                |
-| `--template`       | Template ID to deploy                                                |
-| `--appId`          | Existing app ID to redeploy                                          |
-| `--hostId`         | Target host ID                                                       |
-| `--create-host`    | Create a new host for deployment                                     |
-| `--name`           | App name                                                             |
-| `--sourceBranch`   | Branch to deploy from (default: current branch)                     |
-| `--env NAME=VALUE` | Set environment variable                                            |
-| `--set:<key>`      | Set app property (mainPort, env:PROPERTY_NAME, etc.)                |
-| `--provider`       | Provider for `--create-host`                                         |
-| `--type`           | Instance type for `--create-host`                                    |
-| `--region`         | Region for `--create-host`                                           |
-| `--services`       | Services for `--create-host`                                         |
-| `--timeout`        | Timeout in milliseconds (default: 600000)                            |
+| Option             | Description                                          |
+| ------------------ | ---------------------------------------------------- |
+| `--url`            | GitHub repository URL                                |
+| `--template`       | Template ID to deploy                                |
+| `--appId`          | Existing app ID to redeploy                          |
+| `--hostId`         | Target host ID                                       |
+| `--create-host`    | Create a new host for deployment                     |
+| `--name`           | App name                                             |
+| `--env NAME=VALUE` | Set environment variable                             |
+| `--set:<key>`      | Set app property (mainPort, env:PROPERTY_NAME, etc.) |
+| `--provider`       | Provider for `--create-host`                         |
+| `--type`           | Instance type for `--create-host`                    |
+| `--region`         | Region for `--create-host`                           |
+| `--services`       | Services for `--create-host`                         |
+| `--timeout`        | Timeout in milliseconds (default: 600000)            |
 
 ### `ddc build`
 
