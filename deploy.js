@@ -209,26 +209,30 @@ const createApiClient = auth => {
     "User-Agent": "DollarDeploy-CLI/" + packageJson.version
   };
 
-  const handleResponse = async response => {
-    try {
-      if (!response.ok) {
-        const error = await response.json();
-        throw new Error(`HTTP ${response.status}: ${error.message || response.statusText}`);
-      }
-      if (response.status === 204) {
-        return {};
-      }
-      return await response.json();
-    } catch (error) {
-      const err = new Error(
-        `API Error (${response.url}: ${response.status}): ${error.message || response.statusText}`
-      );
-      Object.assign(err, {
+  const apiError = (response, message) =>
+    Object.assign(
+      new Error(
+        `API Error (${response.url}: ${response.status}): ${message || response.statusText}`
+      ),
+      {
         url: response.url,
         status: response.status,
         statusText: response.statusText
-      });
-      throw err;
+      }
+    );
+
+  const handleResponse = async response => {
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw apiError(response, body?.message);
+    }
+    if (response.status === 204) {
+      return {};
+    }
+    try {
+      return await response.json();
+    } catch (error) {
+      throw apiError(response, error.message);
     }
   };
 
@@ -774,9 +778,115 @@ const cmdHostRemove = async (api, positional, flags) => {
   logger.info(`Host ${hostId} removed from DollarDeploy.`);
 };
 
+const splitList = value =>
+  typeof value === "string"
+    ? value
+        .split(",")
+        .map(item => item.trim())
+        .filter(Boolean)
+    : [];
+
+const collectHostPayload = flags => {
+  const payload = {};
+  const fieldMap = {
+    name: "name",
+    description: "description",
+    ip: "ipAddress",
+    username: "username",
+    sshKeyId: "privateKeyId",
+    projectId: "projectId",
+    backupSchedule: "backupSchedule"
+  };
+
+  for (const [flag, field] of Object.entries(fieldMap)) {
+    if (flags[flag] !== undefined && flags[flag] !== true) {
+      payload[field] = flags[flag];
+    }
+  }
+
+  if (flags.swap !== undefined && flags.swap !== true) {
+    const swap = parseInt(flags.swap, 10);
+    if (Number.isNaN(swap) || swap < 0) {
+      throw new Error(`Invalid --swap value: "${flags.swap}". Expected size in MB, e.g. 4096`);
+    }
+    payload.swap = swap;
+  }
+
+  if (flags.hostnames !== undefined && flags.hostnames !== true) {
+    payload.hostnames = splitList(flags.hostnames);
+  }
+
+  const env = extractEnvFlags(flags);
+  if (Object.keys(env).length > 0) {
+    payload.env = env;
+  }
+
+  return payload;
+};
+
+const HOST_UPDATE_USAGE =
+  "ddc host update <host-id> [--name <name>] [--description <text>] [--ip <ip>] [--username <user>] " +
+  "[--sshKeyId <id>] [--swap <mb>] [--projectId <id>] [--backupSchedule <cron>] " +
+  "[--hostnames <a,b>] [--add-hostname <a,b>] [--remove-hostname <a,b>] [--env NAME=VALUE ...]";
+
+const cmdHostUpdate = async (api, positional, flags) => {
+  const hostId = positional[0] || flags.hostId;
+
+  if (!hostId || flags.help) {
+    logger.info(HOST_UPDATE_USAGE);
+    process.exit(hostId ? 0 : 1);
+  }
+
+  const payload = collectHostPayload(flags);
+  const addHostnames = splitList(flags["add-hostname"]);
+  const removeHostnames = splitList(flags["remove-hostname"]);
+  const changesHostnames = addHostnames.length > 0 || removeHostnames.length > 0;
+
+  // Env and hostnames are replaced as a whole by the API, so merge with the current host
+  if (payload.env || changesHostnames) {
+    const existing = await api.getHost(hostId);
+
+    if (payload.env) {
+      payload.env = { ...(existing.env ?? {}), ...payload.env };
+    }
+
+    if (changesHostnames) {
+      const current = payload.hostnames ?? existing.hostnames ?? [];
+      payload.hostnames = Array.from(new Set([...current, ...addHostnames])).filter(
+        hostname => !removeHostnames.includes(hostname)
+      );
+    }
+  }
+
+  if (Object.keys(payload).length === 0) {
+    throw new Error(`No fields to update.\n${HOST_UPDATE_USAGE}`);
+  }
+
+  logger.info(`Updating host ${hostId}...`);
+  const host = await api.updateHost(hostId, payload);
+  logger.info(`Host updated: ${host.id}`);
+
+  output({
+    id: host.id,
+    name: host.name,
+    status: host.status ?? "draft",
+    ip: host.ipAddress || "",
+    hostnames: jsonOutput ? host.hostnames : (host.hostnames ?? []).join(", "),
+    projectId: host.projectId || "",
+    swap: host.swap ?? ""
+  });
+};
+
 const cmdUser = async api => {
   const user = await api.getUser();
-  output({ id: user.id, name: user.name, email: user.email });
+  const roles = user.roles ?? [];
+  output({
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    tenantId: user.tenantId,
+    roles: jsonOutput ? roles : roles.join(", ")
+  });
 };
 
 const cmdHostPrepare = async (api, positional, flags) => {
@@ -1604,9 +1714,11 @@ USAGE
 
 COMMANDS
   auth                          Authenticate with DollarDeploy
+  auth status                   Show current user, tenant and roles (alias of user)
   host list                     List all hosts
   host get <id>                 Show a single host
   host create                   Create and provision a new host
+  host update <id>              Update host settings (alias: host modify)
   host provision <id>           Provision (or reprovision) a server for a host
   host deprovision <id>         Deprovision the server but keep the host record
   host test <id>                Test SSH connection to a host
@@ -1650,7 +1762,8 @@ GLOBAL OPTIONS
 AUTH & USER INFO
   ddc auth                      Interactive prompt to save API key
   ddc auth --api-key <key>      Save API key non-interactively
-  ddc user                      Show user information
+  ddc user                      Show user, tenant and roles
+  ddc auth status               Same as ddc user
 
 HOST CREATE OPTIONS
   --name <name>                 Host name
@@ -1661,6 +1774,20 @@ HOST CREATE OPTIONS
   --services <list>             Comma-separated services to install (default: docker)
   --skip-prepare                Skip host preparation step
   --timeout <ms>                Timeout in ms (default: 10 minutes)
+
+HOST UPDATE OPTIONS
+  --name <name>                 Host name (min 3 chars)
+  --description <text>          Host description
+  --ip <ip>                     IP address or DNS name used for SSH
+  --username <user>             SSH username
+  --sshKeyId <id>               SSH key to use (see ddc ssh list)
+  --swap <mb>                   Swap size in MB (applied on next prepare)
+  --projectId <id>              Move host to a project
+  --backupSchedule <cron>       Backup schedule (cron expression)
+  --hostnames <a,b>             Replace all hostnames
+  --add-hostname <a,b>          Add hostnames (comma-separated)
+  --remove-hostname <a,b>       Remove hostnames (comma-separated)
+  --env NAME=VALUE              Set host env var, merged with existing (repeatable)
 
 HOST PROVISION OPTIONS
   --provider <provider>         Provider to save before provisioning (hetzner, do, verda)
@@ -1835,8 +1962,9 @@ const main = async () => {
     process.exit(0);
   }
 
-  // Auth doesn't need an API key
-  if (command === "auth") {
+  // Auth doesn't need an API key, except `auth status` which is an alias of `user`
+  const isAuthStatus = command === "auth" && subcommand === "status";
+  if (command === "auth" && !isAuthStatus) {
     await cmdAuth(null, positional.slice(1), flags);
     return;
   }
@@ -1854,7 +1982,7 @@ const main = async () => {
   try {
     const api = createApiClient(auth);
 
-    if (command === "user") {
+    if (command === "user" || isAuthStatus) {
       await cmdUser(api);
     } else if (command === "host") {
       if (subcommand === "prepare") {
@@ -1865,6 +1993,8 @@ const main = async () => {
         await cmdHostGet(api, positional.slice(2), flags);
       } else if (subcommand === "create") {
         await cmdHostCreate(api, positional.slice(2), flags);
+      } else if (subcommand === "update" || subcommand === "modify") {
+        await cmdHostUpdate(api, positional.slice(2), flags);
       } else if (subcommand === "provision") {
         await cmdHostProvision(api, positional.slice(2), flags);
       } else if (subcommand === "deprovision") {
@@ -1879,7 +2009,7 @@ const main = async () => {
         await cmdHostRemove(api, positional.slice(2), flags);
       } else {
         logger.error(
-          `ddc host <prepare|list|get|create|provision|deprovision|test|service|destroy|remove>`
+          `ddc host <prepare|list|get|create|update|provision|deprovision|test|service|destroy|remove>`
         );
         process.exit(1);
       }
@@ -1940,7 +2070,8 @@ const main = async () => {
     if (jsonOutput) {
       logger.warn(JSON.stringify({ error: error.message }, null, 2));
     } else {
-      logger.warn(`Error: ${error.message}`, error.stack);
+      logger.warn(`Error: ${error.message}`);
+      logger.verbose(error.stack);
     }
     process.exit(1);
   }

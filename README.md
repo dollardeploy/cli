@@ -105,12 +105,13 @@ ddc auth --api-key <key>        # Non-interactive
 
 API key resolution order: `--api-key` flag > `DOLLARDEPLOY_API_KEY` env var > `~/.dollardeploy/auth` file.
 
-### `ddc user`
+### `ddc user` / `ddc auth status`
 
-Show current user information.
+Show the current user, the tenant the API key belongs to, and your roles in that tenant (e.g. `admin`, or scoped entries like `write=project:<id>`). Commands your roles don't allow fail with `403`.
 
 ```bash
 ddc user
+ddc auth status   # alias
 ```
 
 ### `ddc host list`
@@ -164,6 +165,33 @@ ddc host create --name my-server --services docker,postgres
 | `--services`     | Comma-separated services to install      | `docker`       |
 | `--skip-prepare` | Skip host preparation step               | `false`        |
 | `--timeout`      | Timeout in milliseconds                  | `600000`       |
+
+### `ddc host update <id>`
+
+Update settings of an existing host (alias: `ddc host modify`). Only the flags you pass are changed. `--env` values are merged into the host's existing env vars, and `--add-hostname` / `--remove-hostname` edit the current hostname list.
+
+```bash
+ddc host update <host-id> --name web-1 --swap 4096
+ddc host update <host-id> --add-hostname api.example.com,www.example.com
+ddc host update <host-id> --env POSTGRES_VERSION=17 --env POSTGRES_DATABASES=app
+```
+
+| Option              | Description                                         |
+| ------------------- | --------------------------------------------------- |
+| `--name`            | Host name (min 3 chars)                             |
+| `--description`     | Host description                                    |
+| `--ip`              | IP address or DNS name used for SSH                 |
+| `--username`        | SSH username                                        |
+| `--sshKeyId`        | SSH key to use (see `ddc ssh list`)                 |
+| `--swap`            | Swap size in MB, applied on the next `host prepare` |
+| `--projectId`       | Move the host to a project                          |
+| `--backupSchedule`  | Backup schedule (cron expression)                   |
+| `--hostnames`       | Replace all hostnames (comma-separated)             |
+| `--add-hostname`    | Add hostnames (comma-separated)                     |
+| `--remove-hostname` | Remove hostnames (comma-separated)                  |
+| `--env`             | `NAME=VALUE` host env var, merged, repeatable       |
+
+Requires the `write` role on the host (or `maintain`/`admin`).
 
 ### `ddc host provision <id>`
 
