@@ -479,6 +479,23 @@ const normalizeRepoUrl = raw => {
   return url;
 };
 
+// True when both URLs point to the same repository, ignoring the differences
+// normalizeRepoUrl removes (trailing slash, .git, ssh form) and letter case.
+const isSameRepo = (a, b) =>
+  !!a && !!b && normalizeRepoUrl(a).toLowerCase() === normalizeRepoUrl(b).toLowerCase();
+
+// Pick an app name not used by any existing app: name, name2, name3, ...
+const findAvailableAppName = (name, apps) => {
+  const taken = new Set(apps.map(app => app.name));
+  let candidate = name;
+  let index = 1;
+  while (taken.has(candidate)) {
+    index++;
+    candidate = name + index;
+  }
+  return candidate;
+};
+
 // Detect the git repository in `dir`: normalized remote URL, current branch,
 // list of uncommitted changes, and count of commits not pushed upstream.
 // Returns null when `dir` is not inside a git work tree.
@@ -1186,20 +1203,22 @@ const cmdAppDeploy = async (api, _positional, flags) => {
   }
 
   // Derive a default app name from the repo URL when none was provided.
-  const repoName = url ? url.split("/").pop() : undefined;
-  const appName = flags.name || templateId || repoName;
+  const repoName = url ? normalizeRepoUrl(url).split("/").pop() : undefined;
+  let appName = flags.name || templateId || repoName;
 
   // Resolve an existing app by repository URL so we redeploy instead of
-  // creating a duplicate.
+  // creating a duplicate. Otherwise make sure the new app gets a unique name.
   if (url) {
     const apps = await api.listApps();
     const existing = apps.find(
-      app => app.repositoryUrl === url && (hostId ? app.hostId === hostId : true)
+      app => isSameRepo(app.repositoryUrl, url) && (hostId ? app.hostId === hostId : true)
     );
     if (existing) {
       logger.info(`Existing appId ${existing.id} name ${existing.name}`);
       appId = existing.id;
       appExisted = true;
+    } else if (appName) {
+      appName = findAvailableAppName(appName, apps);
     }
   }
 
@@ -1422,7 +1441,9 @@ const cmdAppDeploy = async (api, _positional, flags) => {
     });
 
     logger.info("Analyzing repository...");
-    const suggestions = await api.suggestApp(app);
+    // The created app carries the DB default type ("next"); drop it so suggest
+    // detects the real type (deno, bun, docker-compose, ...) like the web UI does.
+    const suggestions = await api.suggestApp({ ...app, type: undefined });
     logger.verbose(
       `AI suggestions: ${suggestions.map(s => `${s.property}: ${JSON.stringify(s.value ?? s.values)}`).join(", ")}`
     );
