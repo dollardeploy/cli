@@ -347,15 +347,7 @@ const createApiClient = auth => {
     removeApp: (id, options = { deleteApp: false }) => post(`/api/app/${id}/remove`, options),
     listSshKeys: () => get("/api/settings/privateKey"),
     createSshKey: data => post("/api/settings/privateKey/create", data),
-    deleteSshKey: id => del(`/api/settings/privateKey/${id}`),
-    listCrons: query => get(`/api/cron${query ? "?" + query : ""}`),
-    getCron: id => get(`/api/cron/${id}`),
-    createCron: data => post("/api/cron", data),
-    updateCron: (id, data) => patch(`/api/cron/${id}`, data),
-    deleteCron: id => del(`/api/cron/${id}`),
-    runCron: id => post(`/api/cron/${id}/run`, {}),
-    listCronRuns: (cronId, limit = 10) =>
-      get(`/api/cron/${encodeURIComponent(cronId)}/runs?limit=${limit}`)
+    deleteSshKey: id => del(`/api/settings/privateKey/${id}`)
   };
 };
 
@@ -2097,196 +2089,6 @@ const extractAppFlags = flags => {
   return props;
 };
 
-// ─── Cron ────────────────────────────────────────────────────────────────────
-
-// Collect a cron create/update payload from CLI flags. On update, the target
-// (appId/hostId) cannot change and is dropped.
-const collectCronPayload = (flags, isUpdate = false) => {
-  const p = {};
-  if (flags.appId || flags.app) {
-    p.appId = flags.appId || flags.app;
-  }
-  if (flags.hostId || flags.host) {
-    p.hostId = flags.hostId || flags.host;
-  }
-  if (flags.name !== undefined) {
-    p.name = flags.name;
-  }
-  if (flags.type) {
-    p.type = flags.type;
-  }
-  if (flags.schedule) {
-    p.schedule = flags.schedule;
-  }
-  if (flags.timezone || flags.tz) {
-    p.timezone = flags.timezone || flags.tz;
-  }
-  if (flags.path) {
-    p.path = flags.path;
-  }
-  if (flags.method) {
-    p.method = flags.method;
-  }
-  if (flags.authEnvVar || flags.secret) {
-    p.authEnvVar = flags.authEnvVar || flags.secret;
-  }
-  if (flags.command || flags.cmd) {
-    p.command = flags.command || flags.cmd;
-  }
-  if (flags.retries !== undefined) {
-    p.retries = Number(flags.retries);
-  }
-  if (flags.disabled) {
-    p.enabled = false;
-  } else if (flags.enabled !== undefined) {
-    p.enabled = flags.enabled === true || flags.enabled === "true";
-  }
-  if (flags.notify !== undefined || flags.alert !== undefined) {
-    const notify = flags.notify ?? flags.alert;
-    p.notify = notify ? String(notify).split(",") : [];
-  }
-  if (isUpdate) {
-    delete p.appId;
-    delete p.hostId;
-  }
-  return p;
-};
-
-// A run task in the shape GET /api/cron/{id}/runs returns: the outcome is in the
-// task result, the trigger in its args.
-const toCronRun = task => {
-  let result;
-  try {
-    result = task.result ? JSON.parse(task.result) : undefined;
-  } catch {
-    // An unparsable result still shows the task status.
-  }
-  return {
-    id: task.id,
-    createdAt: task.createdAt,
-    taskStatus: task.status,
-    trigger: task.args?.cronTrigger || "schedule",
-    result
-  };
-};
-
-// One row per cron run.
-const formatCronRun = run => ({
-  id: run.id,
-  trigger: run.trigger,
-  status: run.result?.status || run.taskStatus,
-  code: run.result?.httpStatus ?? run.result?.exitCode ?? "",
-  durationMs: run.result?.durationMs ?? "",
-  createdAt: run.createdAt,
-  error: run.result?.error || ""
-});
-
-const cmdCron = async (api, positional, flags) => {
-  const sub = positional[0];
-  const rest = positional.slice(1);
-
-  if (sub === "list" || sub === "ls") {
-    const params = [];
-    if (flags.appId || flags.app) {
-      params.push(`appId=${flags.appId || flags.app}`);
-    }
-    if (flags.hostId || flags.host) {
-      params.push(`hostId=${flags.hostId || flags.host}`);
-    }
-    const crons = await api.listCrons(params.join("&"));
-    output(
-      crons.map(c => ({
-        id: c.id,
-        name: c.name || "",
-        type: c.type,
-        schedule: c.schedule,
-        timezone: c.timezone || "UTC",
-        enabled: c.enabled,
-        lastStatus: c.lastStatus || "",
-        nextRunAt: c.nextRunAt || ""
-      }))
-    );
-    return;
-  }
-
-  if (sub === "get") {
-    const id = rest[0] || flags.id;
-    if (!id) {
-      throw new Error("Usage: ddc cron get <cron-id>");
-    }
-    output(await api.getCron(id));
-    return;
-  }
-
-  if (sub === "create") {
-    const data = collectCronPayload(flags);
-    const cron = await api.createCron(data);
-    logger.info(`Cron created: ${cron.id}`);
-    output(cron);
-    return;
-  }
-
-  if (sub === "update" || sub === "modify") {
-    const id = rest[0] || flags.id;
-    if (!id) {
-      throw new Error("Usage: ddc cron update <cron-id> [flags]");
-    }
-    const data = collectCronPayload(flags, true);
-    const cron = await api.updateCron(id, data);
-    logger.info(`Cron updated: ${cron.id}`);
-    output(cron);
-    return;
-  }
-
-  if (sub === "delete" || sub === "rm" || sub === "remove") {
-    const id = rest[0] || flags.id;
-    if (!id) {
-      throw new Error("Usage: ddc cron delete <cron-id>");
-    }
-    await api.deleteCron(id);
-    logger.info(`Cron deleted: ${id}`);
-    return;
-  }
-
-  if (sub === "run") {
-    const id = rest[0] || flags.id;
-    if (!id) {
-      throw new Error("Usage: ddc cron run <cron-id> [--wait]");
-    }
-    const task = await api.runCron(id);
-    logger.info(`Cron run queued: ${task.id}`);
-    if (!flags.wait) {
-      output(task);
-      return;
-    }
-
-    // A failed run ends the task with status "error"; show its result either way.
-    await waitForTask(api, task.id, Number(flags.timeout) || DEFAULT_TIMEOUT).catch(err =>
-      logger.verbose(err.message)
-    );
-    const done = toCronRun(await api.getTask(task.id));
-    const run = formatCronRun(done);
-    output({ ...run, output: done.result?.outputSnippet || "" });
-    if (run.status !== "ok") {
-      process.exit(1);
-    }
-    return;
-  }
-
-  if (sub === "runs") {
-    const id = rest[0] || flags.id;
-    if (!id) {
-      throw new Error("Usage: ddc cron runs <cron-id> [--limit <n>]");
-    }
-    const runs = await api.listCronRuns(id, Number(flags.limit) || 10);
-    output(runs.map(formatCronRun));
-    return;
-  }
-
-  logger.error("ddc cron <list|get|create|update|delete|run|runs>");
-  process.exit(1);
-};
-
 // ─── Help ────────────────────────────────────────────────────────────────────
 
 const showHelp = () => {
@@ -2330,13 +2132,6 @@ COMMANDS
   task list                     List tasks (--status to filter)
   task get <id>                 Show a task
   task cancel <id>              Cancel a running task
-  cron list                     List crons (--app <id> / --host <id>)
-  cron get <id>                 Show a cron
-  cron create                   Create a cron (--app/--host --type --schedule ...)
-  cron update <id>              Update a cron (--schedule, --enabled, --disabled, ...)
-  cron delete <id>              Delete a cron
-  cron run <id>                 Run a cron now (--wait to wait and show the result)
-  cron runs <id>                Show recent runs of a cron (--limit <n>, default 10)
   logs                          Show journal logs (--task/--app/--host/--follow)
   provision                     List available regions/types/images for a provider
   version                       Show CLI version
@@ -2379,20 +2174,6 @@ HOST UPDATE OPTIONS
   --add-hostname <a,b>          Add hostnames (comma-separated)
   --remove-hostname <a,b>       Remove hostnames (comma-separated)
   --env NAME=VALUE              Set host env var, merged with existing (repeatable)
-
-CRON OPTIONS (ddc cron create / update)
-  --app <id> | --host <id>      Target (create only): app crons run http or command, host crons command
-  --name <name>                 Cron name (default "Cron #N")
-  --type <http|command>         http calls the app URL + path, command runs over SSH
-  --schedule <expr>             5-field cron expression, e.g. "*/15 * * * *"
-  --timezone <tz>               IANA timezone (default UTC), alias --tz
-  --path <path>                 http: path on the app, e.g. /api/cron
-  --method <GET|POST>           http: request method (default GET)
-  --authEnvVar <name>           http: app env var with the bearer secret (default CRON_SECRET), alias --secret
-  --command <cmd>               command: shell command, alias --cmd
-  --retries <0-3>               Retries on failure (default 1)
-  --notify <failed,success>     When to send a notification (default failed)
-  --enabled true|false          Enable or disable, or --disabled
 
 HOST PROVISION OPTIONS
   --provider <provider>         Provider to save before provisioning (hetzner, do, verda)
@@ -2681,15 +2462,13 @@ const main = async () => {
       }
     } else if (command === "task") {
       await cmdTask(api, positional.slice(1), flags);
-    } else if (command === "cron") {
-      await cmdCron(api, positional.slice(1), flags);
     } else if (command === "logs") {
       await cmdLogs(api, positional.slice(1), flags);
     } else if (command === "provision") {
       await cmdProvision(api, positional.slice(1), flags);
     } else {
       logger.info(
-        `ddc <auth|user|host|app|deploy|build|ssh|template|task|cron|logs|provision|version|help>`
+        `ddc <auth|user|host|app|deploy|build|ssh|template|task|logs|provision|version|help>`
       );
       process.exit(1);
     }
