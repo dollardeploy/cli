@@ -2125,8 +2125,8 @@ const collectCronPayload = (flags, isUpdate = false) => {
   if (flags.method) {
     p.method = flags.method;
   }
-  if (flags.authFrom || flags.secret) {
-    p.authFrom = flags.authFrom || flags.secret;
+  if (flags.authEnvVar || flags.secret) {
+    p.authEnvVar = flags.authEnvVar || flags.secret;
   }
   if (flags.command || flags.cmd) {
     p.command = flags.command || flags.cmd;
