@@ -355,7 +355,7 @@ const createApiClient = auth => {
     deleteCron: id => del(`/api/cron/${id}`),
     runCron: id => post(`/api/cron/${id}/run`, {}),
     listCronRuns: (cronId, limit = 10) =>
-      get(`/api/task?type=run:cron&cronId=${encodeURIComponent(cronId)}&limit=${limit}`)
+      get(`/api/cron/${encodeURIComponent(cronId)}/runs?limit=${limit}`)
   };
 };
 
@@ -2152,24 +2152,34 @@ const collectCronPayload = (flags, isUpdate = false) => {
   return p;
 };
 
-// One row per cron run: the outcome is in the task result, the trigger in its args.
-const formatCronRun = task => {
-  let result = {};
+// A run task in the shape GET /api/cron/{id}/runs returns: the outcome is in the
+// task result, the trigger in its args.
+const toCronRun = task => {
+  let result;
   try {
-    result = task.result ? JSON.parse(task.result) : {};
+    result = task.result ? JSON.parse(task.result) : undefined;
   } catch {
-    // An unparsable result still shows the task status below.
+    // An unparsable result still shows the task status.
   }
   return {
     id: task.id,
-    trigger: task.args?.cronTrigger || "schedule",
-    status: result.status || task.status,
-    code: result.httpStatus ?? result.exitCode ?? "",
-    durationMs: result.durationMs ?? "",
     createdAt: task.createdAt,
-    error: result.error || ""
+    taskStatus: task.status,
+    trigger: task.args?.cronTrigger || "schedule",
+    result
   };
 };
+
+// One row per cron run.
+const formatCronRun = run => ({
+  id: run.id,
+  trigger: run.trigger,
+  status: run.result?.status || run.taskStatus,
+  code: run.result?.httpStatus ?? run.result?.exitCode ?? "",
+  durationMs: run.result?.durationMs ?? "",
+  createdAt: run.createdAt,
+  error: run.result?.error || ""
+});
 
 const cmdCron = async (api, positional, flags) => {
   const sub = positional[0];
@@ -2254,15 +2264,9 @@ const cmdCron = async (api, positional, flags) => {
     await waitForTask(api, task.id, Number(flags.timeout) || DEFAULT_TIMEOUT).catch(err =>
       logger.verbose(err.message)
     );
-    const done = await api.getTask(task.id);
+    const done = toCronRun(await api.getTask(task.id));
     const run = formatCronRun(done);
-    let snippet = "";
-    try {
-      snippet = JSON.parse(done.result || "{}").outputSnippet || "";
-    } catch {
-      // No output to show.
-    }
-    output({ ...run, output: snippet });
+    output({ ...run, output: done.result?.outputSnippet || "" });
     if (run.status !== "ok") {
       process.exit(1);
     }

@@ -730,15 +730,15 @@ await checkUrl(`https://${app.hostname}`);
 
 #### Crons
 
-| Method                         | Description                             |
-| ------------------------------ | --------------------------------------- |
-| `listCrons(query?)`            | List crons, e.g. `"appId=..."`          |
-| `getCron(id)`                  | Get a cron                              |
-| `createCron(data)`             | Create a cron                           |
-| `updateCron(id, data)`         | Update a cron                           |
-| `deleteCron(id)`               | Delete a cron                           |
-| `runCron(id)`                  | Queue a run now, returns the task       |
-| `listCronRuns(cronId, limit?)` | Recent run tasks of a cron (default 10) |
+| Method                         | Description                        |
+| ------------------------------ | ---------------------------------- |
+| `listCrons(query?)`            | List crons, e.g. `"appId=..."`     |
+| `getCron(id)`                  | Get a cron                         |
+| `createCron(data)`             | Create a cron                      |
+| `updateCron(id, data)`         | Update a cron                      |
+| `deleteCron(id)`               | Delete a cron                      |
+| `runCron(id)`                  | Queue a run now, returns the task  |
+| `listCronRuns(cronId, limit?)` | Recent runs of a cron (default 10) |
 
 #### SSH Keys
 
