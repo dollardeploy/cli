@@ -2139,8 +2139,9 @@ const collectCronPayload = (flags, isUpdate = false) => {
   } else if (flags.enabled !== undefined) {
     p.enabled = flags.enabled === true || flags.enabled === "true";
   }
-  if (flags.alert !== undefined) {
-    p.alertType = flags.alert ? String(flags.alert).split(",") : [];
+  if (flags.notify !== undefined || flags.alert !== undefined) {
+    const notify = flags.notify ?? flags.alert;
+    p.notify = notify ? String(notify).split(",") : [];
   }
   if (isUpdate) {
     delete p.appId;
