@@ -511,6 +511,47 @@ ddc task get <task-id>              # Show a single task
 ddc task cancel <task-id>           # Cancel a running task
 ```
 
+### `ddc cron`
+
+Schedule jobs for an app (an HTTP request to the app, or an SSH command in the app directory) or a host (an SSH command). Crons need a paid plan.
+
+```bash
+ddc cron list --app <app-id>        # Or --host <host-id>
+ddc cron get <cron-id>
+
+# HTTP cron: calls https://<app hostname>/api/cron every 15 minutes
+ddc cron create --app <app-id> --type http --schedule "*/15 * * * *" --path /api/cron
+
+# Command cron: runs in the app directory as the app user, with the app env
+ddc cron create --app <app-id> --type command --schedule "0 3 * * *" --command "npm run cleanup"
+
+# Host cron: runs as the host SSH user, with the host env
+ddc cron create --host <host-id> --type command --schedule "0 * * * *" --command "df -h /"
+
+ddc cron update <cron-id> --schedule "*/30 * * * *" --notify failed,success
+ddc cron update <cron-id> --disabled
+ddc cron run <cron-id> --wait       # Run now and print the result (exit code 1 if it failed)
+ddc cron runs <cron-id>             # Recent runs: trigger, status, HTTP/exit code, duration
+ddc cron delete <cron-id>
+```
+
+The first HTTP cron on an app generates `CRON_SECRET` on the app env. Redeploy the app once so it receives the value, and check `Authorization: Bearer $CRON_SECRET` in your handler.
+
+| Option         | Description                                                        | Default       |
+| -------------- | ------------------------------------------------------------------ | ------------- |
+| `--app`        | App to run the cron for (create only)                              | -             |
+| `--host`       | Host to run the cron on (create only)                              | -             |
+| `--type`       | `http` (apps only) or `command`                                    | -             |
+| `--schedule`   | 5-field cron expression                                            | -             |
+| `--timezone`   | IANA timezone, alias `--tz`                                        | `UTC`         |
+| `--path`       | HTTP path on the app                                               | -             |
+| `--method`     | `GET` or `POST`                                                    | `GET`         |
+| `--authEnvVar` | App env var holding the bearer secret, alias `--secret`            | `CRON_SECRET` |
+| `--command`    | Shell command, alias `--cmd`                                       | -             |
+| `--retries`    | Retries on failure, 0 to 3                                         | `1`           |
+| `--notify`     | When to send a notification: `failed`, `success` (comma separated) | `failed`      |
+| `--disabled`   | Create or update the cron as disabled (`--enabled true` to enable) | -             |
+
 ### `ddc logs`
 
 Show journal logs. Filter by task, app, or host, and optionally follow for new entries.
@@ -686,6 +727,18 @@ await checkUrl(`https://${app.hostname}`);
 | `deployApp(id)`           | Deploy built app                 |
 | `deleteApp(id)`           | Delete an app                    |
 | `removeApp(id, options?)` | Remove app from host             |
+
+#### Crons
+
+| Method                         | Description                             |
+| ------------------------------ | --------------------------------------- |
+| `listCrons(query?)`            | List crons, e.g. `"appId=..."`          |
+| `getCron(id)`                  | Get a cron                              |
+| `createCron(data)`             | Create a cron                           |
+| `updateCron(id, data)`         | Update a cron                           |
+| `deleteCron(id)`               | Delete a cron                           |
+| `runCron(id)`                  | Queue a run now, returns the task       |
+| `listCronRuns(cronId, limit?)` | Recent run tasks of a cron (default 10) |
 
 #### SSH Keys
 

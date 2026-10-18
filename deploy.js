@@ -353,7 +353,9 @@ const createApiClient = auth => {
     createCron: data => post("/api/cron", data),
     updateCron: (id, data) => patch(`/api/cron/${id}`, data),
     deleteCron: id => del(`/api/cron/${id}`),
-    runCron: id => post(`/api/cron/${id}/run`, {})
+    runCron: id => post(`/api/cron/${id}/run`, {}),
+    listCronRuns: (cronId, limit = 10) =>
+      get(`/api/task?type=run:cron&cronId=${encodeURIComponent(cronId)}&limit=${limit}`)
   };
 };
 
@@ -2150,6 +2152,25 @@ const collectCronPayload = (flags, isUpdate = false) => {
   return p;
 };
 
+// One row per cron run: the outcome is in the task result, the trigger in its args.
+const formatCronRun = task => {
+  let result = {};
+  try {
+    result = task.result ? JSON.parse(task.result) : {};
+  } catch {
+    // An unparsable result still shows the task status below.
+  }
+  return {
+    id: task.id,
+    trigger: task.args?.cronTrigger || "schedule",
+    status: result.status || task.status,
+    code: result.httpStatus ?? result.exitCode ?? "",
+    durationMs: result.durationMs ?? "",
+    createdAt: task.createdAt,
+    error: result.error || ""
+  };
+};
+
 const cmdCron = async (api, positional, flags) => {
   const sub = positional[0];
   const rest = positional.slice(1);
@@ -2220,15 +2241,45 @@ const cmdCron = async (api, positional, flags) => {
   if (sub === "run") {
     const id = rest[0] || flags.id;
     if (!id) {
-      throw new Error("Usage: ddc cron run <cron-id>");
+      throw new Error("Usage: ddc cron run <cron-id> [--wait]");
     }
     const task = await api.runCron(id);
     logger.info(`Cron run queued: ${task.id}`);
-    output(task);
+    if (!flags.wait) {
+      output(task);
+      return;
+    }
+
+    // A failed run ends the task with status "error"; show its result either way.
+    await waitForTask(api, task.id, Number(flags.timeout) || DEFAULT_TIMEOUT).catch(err =>
+      logger.verbose(err.message)
+    );
+    const done = await api.getTask(task.id);
+    const run = formatCronRun(done);
+    let snippet = "";
+    try {
+      snippet = JSON.parse(done.result || "{}").outputSnippet || "";
+    } catch {
+      // No output to show.
+    }
+    output({ ...run, output: snippet });
+    if (run.status !== "ok") {
+      process.exit(1);
+    }
     return;
   }
 
-  logger.error("ddc cron <list|get|create|update|delete|run>");
+  if (sub === "runs") {
+    const id = rest[0] || flags.id;
+    if (!id) {
+      throw new Error("Usage: ddc cron runs <cron-id> [--limit <n>]");
+    }
+    const runs = await api.listCronRuns(id, Number(flags.limit) || 10);
+    output(runs.map(formatCronRun));
+    return;
+  }
+
+  logger.error("ddc cron <list|get|create|update|delete|run|runs>");
   process.exit(1);
 };
 
@@ -2280,7 +2331,8 @@ COMMANDS
   cron create                   Create a cron (--app/--host --type --schedule ...)
   cron update <id>              Update a cron (--schedule, --enabled, --disabled, ...)
   cron delete <id>              Delete a cron
-  cron run <id>                 Run a cron now
+  cron run <id>                 Run a cron now (--wait to wait and show the result)
+  cron runs <id>                Show recent runs of a cron (--limit <n>, default 10)
   logs                          Show journal logs (--task/--app/--host/--follow)
   provision                     List available regions/types/images for a provider
   version                       Show CLI version
@@ -2323,6 +2375,20 @@ HOST UPDATE OPTIONS
   --add-hostname <a,b>          Add hostnames (comma-separated)
   --remove-hostname <a,b>       Remove hostnames (comma-separated)
   --env NAME=VALUE              Set host env var, merged with existing (repeatable)
+
+CRON OPTIONS (ddc cron create / update)
+  --app <id> | --host <id>      Target (create only): app crons run http or command, host crons command
+  --name <name>                 Cron name (default "Cron #N")
+  --type <http|command>         http calls the app URL + path, command runs over SSH
+  --schedule <expr>             5-field cron expression, e.g. "*/15 * * * *"
+  --timezone <tz>               IANA timezone (default UTC), alias --tz
+  --path <path>                 http: path on the app, e.g. /api/cron
+  --method <GET|POST>           http: request method (default GET)
+  --authEnvVar <name>           http: app env var with the bearer secret (default CRON_SECRET), alias --secret
+  --command <cmd>               command: shell command, alias --cmd
+  --retries <0-3>               Retries on failure (default 1)
+  --notify <failed,success>     When to send a notification (default failed)
+  --enabled true|false          Enable or disable, or --disabled
 
 HOST PROVISION OPTIONS
   --provider <provider>         Provider to save before provisioning (hetzner, do, verda)
