@@ -8,6 +8,8 @@ const fs = require("fs");
 const path = require("path");
 const readline = require("readline");
 const { execFileSync } = require("child_process");
+const { Readable } = require("stream");
+const { pipeline } = require("stream/promises");
 const packageJson = require("./package.json");
 
 const DEFAULT_PROVIDER = "hetzner";
@@ -109,6 +111,18 @@ const formatFieldValue = value => {
       .join(", ");
   }
   return String(value);
+};
+
+// URL query string from the params that are set, values encoded
+const toQuery = params =>
+  Object.entries(params)
+    .filter(([, v]) => v !== undefined && v !== null && v !== "")
+    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+    .join("&");
+
+const withQuery = (url, params) => {
+  const query = toQuery(params);
+  return query ? `${url}?${query}` : url;
 };
 
 // ─── Auth helpers ────────────────────────────────────────────────────────────
@@ -222,11 +236,16 @@ const createApiClient = auth => {
       }
     );
 
-  const handleResponse = async response => {
+  const assertOk = async response => {
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
       throw apiError(response, body?.message);
     }
+    return response;
+  };
+
+  const handleResponse = async response => {
+    await assertOk(response);
     if (response.status === 204) {
       return {};
     }
@@ -287,6 +306,19 @@ const createApiClient = auth => {
     });
   };
 
+  // GET returning the response itself, to stream the body
+  const download = url => {
+    logger.verbose(`GET ${url}...`);
+    const startTime = Date.now();
+    return fetch(new URL(url, baseUrl).toString(), {
+      method: "GET",
+      headers
+    }).then(res => {
+      logger.verbose(`GET ${url} (status: ${res.status}) Δ ${Date.now() - startTime}ms`);
+      return assertOk(res);
+    });
+  };
+
   return {
     baseUrl,
     createHost: name => post("/api/host/create", { name }),
@@ -304,15 +336,19 @@ const createApiClient = auth => {
     saveProvision: (hostId, data) => patch(`/api/host/${hostId}/provision`, data),
     provisionHost: hostId => post(`/api/host/${hostId}/provision`),
     getProviderConfig: (provider, filters = {}) =>
-      get(
-        `/api/provider/${provider}?` +
-          Object.entries(filters)
-            .filter(([, v]) => v !== undefined && v !== null && v !== "")
-            .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
-            .join("&")
-      ),
+      get(withQuery(`/api/provider/${provider}`, filters)),
     testConnection: hostId => post(`/api/host/${hostId}/test`),
     prepareHost: hostId => post(`/api/host/${hostId}/prepare`),
+    inspectHost: (hostId, body) =>
+      post(`/api/host/${encodeURIComponent(hostId)}/inspect`, body),
+    getInspection: (hostId, inspectionId) =>
+      get(withQuery(`/api/host/${encodeURIComponent(hostId)}/inspect`, { inspectionId })),
+    listInspections: (hostId, limit) =>
+      get(withQuery(`/api/host/${encodeURIComponent(hostId)}/inspect/list`, { limit })),
+    downloadInspection: (hostId, inspectionId) =>
+      download(
+        withQuery(`/api/host/${encodeURIComponent(hostId)}/inspect/download`, { inspectionId })
+      ),
     createService: (hostId, type) => post(`/api/host/${hostId}/service/create`, { type }),
     listServices: hostId => get(`/api/host/${hostId}/service`),
     getService: (hostId, serviceId) => get(`/api/host/${hostId}/service/${serviceId}`),
@@ -324,14 +360,7 @@ const createApiClient = auth => {
     listTasks: status => get(`/api/task${status ? `?status=${status}` : ""}`),
     cancelTask: id => post(`/api/task/${id}/cancel`),
     getTaskJournal: id => get(`/api/journal/latest?taskId=${id}`),
-    getLogs: params =>
-      get(
-        "/api/journal/latest?" +
-          Object.entries(params)
-            .filter(([, v]) => v !== undefined && v !== null && v !== "")
-            .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
-            .join("&")
-      ),
+    getLogs: params => get(withQuery("/api/journal/latest", params)),
     getTemplates: () => get("/api/template"),
     getTemplate: id => get(`/api/template/${id}`),
     launchTemplate: args => post("/api/task/launch", args),
@@ -2097,6 +2126,172 @@ const extractAppFlags = flags => {
   return props;
 };
 
+// ─── Host inspection ─────────────────────────────────────────────────────────
+
+const INSPECT_COMMANDS_HELP = `  host inspect create <id>      Inspect a host, read-only (--wait to wait and show the report)
+  host inspect get <id>         Show the latest inspection report (--inspection <id> for another)
+  host inspect list <id>        List inspections of a host, newest first (--limit <n>, default 20)
+  host inspect download <id>    Save the full inspection output as JSON (--inspection, --output)`;
+
+const INSPECT_OPTIONS_HELP = `  --app <id>                    create: inspect only this app on the host
+  --since <24h|3d|ISO date>     create: start of the inspected window, at most 7 days (default 24h)
+  --sections <a,b>              create: sections to inspect (default all), e.g. docker,packages
+  --wait                        create: wait for the inspection and show the report
+  --timeout <ms>                create: wait timeout in ms (default: 10 minutes)
+  --inspection <id>             get / download: an inspection from \`host inspect list\` (default latest)
+  --output <file|->             download: file to save to (default the server file name), - for stdout
+  --force                       download: overwrite an existing file`;
+
+const RELATIVE_UNITS_MS = { m: 60_000, h: 3_600_000, d: 86_400_000 };
+
+// "90m", "24h", "3d" or an ISO date as an ISO date
+const parseSince = since => {
+  const relative = /^(\d+)([mhd])$/.exec(since);
+  if (relative) {
+    const ms = Number(relative[1]) * RELATIVE_UNITS_MS[relative[2]];
+    return new Date(Date.now() - ms).toISOString();
+  }
+
+  const date = new Date(since);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`Invalid --since "${since}", use e.g. 24h, 3d or an ISO date`);
+  }
+  return date.toISOString();
+};
+
+// Headline, then one row per inspected section
+const printInspection = inspection => {
+  if (jsonOutput) {
+    output({ inspection });
+    return;
+  }
+
+  if (!inspection) {
+    logger.info("The host was not inspected yet. Run `ddc host inspect create <host-id>`.");
+    return;
+  }
+
+  const { result } = inspection;
+  logger.log(`${result.status.toUpperCase()}: ${inspection.message}`);
+  logger.log(
+    `id: ${inspection.id}  createdAt: ${inspection.createdAt}  window: ${result.startDate} - ${result.endDate}`
+  );
+  output(
+    Object.entries(result.reports).map(([section, report]) => ({
+      section,
+      status: report.status,
+      messages: shorten(report.messages.join("; "))
+    }))
+  );
+};
+
+// The file name the server suggests, without any directories
+const dispositionFileName = response => {
+  const match = /filename="([^"]+)"/.exec(response.headers.get("content-disposition") || "");
+  return match ? path.basename(match[1]) : undefined;
+};
+
+const cmdHostInspect = async (api, positional, flags) => {
+  const sub = positional[0];
+  const hostId = positional[1] || flags.hostId || flags.host;
+
+  if (flags.help || !sub || !hostId) {
+    logger.info(`ddc host inspect <create|get|list|download> <host-id>
+
+${INSPECT_COMMANDS_HELP}
+
+OPTIONS
+${INSPECT_OPTIONS_HELP}`);
+    process.exit(flags.help ? 0 : 1);
+  }
+
+  if (sub === "create") {
+    const body = {};
+    if (flags.app || flags.appId) {
+      body.appId = flags.app || flags.appId;
+    }
+    if (flags.since) {
+      body.startDate = parseSince(String(flags.since));
+    }
+    if (flags.sections) {
+      body.sections = String(flags.sections)
+        .split(",")
+        .map(s => s.trim())
+        .filter(s => s !== "");
+    }
+
+    const task = await api.inspectHost(hostId, body);
+    logger.info(`Inspection queued: task ${task.id}`);
+    if (!flags.wait) {
+      output(task);
+      return;
+    }
+
+    await waitForTask(api, task.id, Number(flags.timeout) || DEFAULT_TIMEOUT);
+    const { inspection } = await api.getInspection(hostId);
+    if (inspection && inspection.taskId !== task.id) {
+      logger.warn(
+        `Showing a newer inspection (task ${inspection.taskId}) than task ${task.id}`
+      );
+    }
+    printInspection(inspection);
+    if (inspection?.result.status === "error") {
+      process.exit(1);
+    }
+    return;
+  }
+
+  if (sub === "get") {
+    const { inspection } = await api.getInspection(hostId, flags.inspection);
+    printInspection(inspection);
+    return;
+  }
+
+  if (sub === "list" || sub === "ls") {
+    const { inspections } = await api.listInspections(hostId, Number(flags.limit) || 20);
+    output(
+      jsonOutput
+        ? inspections
+        : inspections.map(i => ({
+            id: i.id,
+            createdAt: i.createdAt,
+            status: i.status,
+            event: i.event || "",
+            sections: i.sections.length,
+            message: shorten(i.message, 70)
+          }))
+    );
+    return;
+  }
+
+  if (sub === "download") {
+    const response = await api.downloadInspection(hostId, flags.inspection);
+    const target =
+      flags.output || dispositionFileName(response) || `inspection-${hostId}.json`;
+    const body = Readable.fromWeb(response.body);
+    if (target === "-") {
+      await pipeline(body, process.stdout);
+      return;
+    }
+
+    // Host logs are in the output (secrets masked), keep the file private
+    await pipeline(
+      body,
+      fs.createWriteStream(target, { flags: flags.force ? "w" : "wx", mode: 0o600 })
+    ).catch(err => {
+      if (err.code === "EEXIST") {
+        throw new Error(`${target} already exists, use --force to overwrite it`);
+      }
+      throw err;
+    });
+    logger.info(`Inspection output saved to ${target}`);
+    return;
+  }
+
+  logger.error("ddc host inspect <create|get|list|download> <host-id>");
+  process.exit(1);
+};
+
 // ─── Cron ────────────────────────────────────────────────────────────────────
 
 // Collect a cron create/update payload from CLI flags. On update, the target
@@ -2181,9 +2376,41 @@ const formatCronRun = run => ({
   error: run.result?.error || ""
 });
 
+const CRON_COMMANDS_HELP = `  cron list                     List crons (--app <id> / --host <id>)
+  cron get <id>                 Show a cron
+  cron create                   Create a cron (--app/--host --type --schedule ...)
+  cron update <id>              Update a cron (--schedule, --enabled, --disabled, ...)
+  cron delete <id>              Delete a cron
+  cron run <id>                 Run a cron now (--wait to wait and show the result)
+  cron runs <id>                Show recent runs of a cron (--limit <n>, default 10)`;
+
+const CRON_OPTIONS_HELP = `  --app <id> | --host <id>      Target (create only): app crons run http or command, host crons command
+  --name <name>                 Cron name (default "Cron #N")
+  --type <http|command>         http calls the app URL + path, command runs over SSH
+  --schedule <expr>             5-field cron expression, e.g. "*/15 * * * *"
+  --timezone <tz>               IANA timezone (default UTC), alias --tz
+  --path <path>                 http: path on the app, e.g. /api/cron
+  --method <GET|POST>           http: request method (default GET)
+  --authEnvVar <name>           http: app env var with the bearer secret (default CRON_SECRET), alias --secret
+  --command <cmd>               command: shell command, alias --cmd
+  --retries <0-3>               Retries on failure (default 1)
+  --notify <failed,success>     When to send a notification (default failed)
+  --enabled true|false          Enable or disable, or --disabled`;
+
 const cmdCron = async (api, positional, flags) => {
   const sub = positional[0];
   const rest = positional.slice(1);
+
+  // Before any request, so `--help` never creates, runs or deletes a cron
+  if (flags.help || !sub) {
+    logger.info(`ddc cron <list|get|create|update|delete|run|runs>
+
+${CRON_COMMANDS_HELP}
+
+OPTIONS (create / update)
+${CRON_OPTIONS_HELP}`);
+    process.exit(flags.help ? 0 : 1);
+  }
 
   if (sub === "list" || sub === "ls") {
     const params = [];
@@ -2308,6 +2535,7 @@ COMMANDS
   host destroy <id>             Deprovision and permanently delete a host
   host remove <id>              Remove a host from DollarDeploy (keeps the server)
   host prepare <id>             Prepare a host for deployment
+${INSPECT_COMMANDS_HELP}
   host service list <id>        List services installed on a host
   host service get <id> <sid>   Show a single service on a host
   host service add <id> <type>  Install a service on a host (e.g. docker)
@@ -2330,13 +2558,7 @@ COMMANDS
   task list                     List tasks (--status to filter)
   task get <id>                 Show a task
   task cancel <id>              Cancel a running task
-  cron list                     List crons (--app <id> / --host <id>)
-  cron get <id>                 Show a cron
-  cron create                   Create a cron (--app/--host --type --schedule ...)
-  cron update <id>              Update a cron (--schedule, --enabled, --disabled, ...)
-  cron delete <id>              Delete a cron
-  cron run <id>                 Run a cron now (--wait to wait and show the result)
-  cron runs <id>                Show recent runs of a cron (--limit <n>, default 10)
+${CRON_COMMANDS_HELP}
   logs                          Show journal logs (--task/--app/--host/--follow)
   provision                     List available regions/types/images for a provider
   version                       Show CLI version
@@ -2381,18 +2603,10 @@ HOST UPDATE OPTIONS
   --env NAME=VALUE              Set host env var, merged with existing (repeatable)
 
 CRON OPTIONS (ddc cron create / update)
-  --app <id> | --host <id>      Target (create only): app crons run http or command, host crons command
-  --name <name>                 Cron name (default "Cron #N")
-  --type <http|command>         http calls the app URL + path, command runs over SSH
-  --schedule <expr>             5-field cron expression, e.g. "*/15 * * * *"
-  --timezone <tz>               IANA timezone (default UTC), alias --tz
-  --path <path>                 http: path on the app, e.g. /api/cron
-  --method <GET|POST>           http: request method (default GET)
-  --authEnvVar <name>           http: app env var with the bearer secret (default CRON_SECRET), alias --secret
-  --command <cmd>               command: shell command, alias --cmd
-  --retries <0-3>               Retries on failure (default 1)
-  --notify <failed,success>     When to send a notification (default failed)
-  --enabled true|false          Enable or disable, or --disabled
+${CRON_OPTIONS_HELP}
+
+HOST INSPECT OPTIONS
+${INSPECT_OPTIONS_HELP}
 
 HOST PROVISION OPTIONS
   --provider <provider>         Provider to save before provisioning (hetzner, do, verda)
@@ -2626,6 +2840,8 @@ const main = async () => {
         await cmdHostDeprovision(api, positional.slice(2), flags);
       } else if (subcommand === "test") {
         await cmdHostTest(api, positional.slice(2), flags);
+      } else if (subcommand === "inspect") {
+        await cmdHostInspect(api, positional.slice(2), flags);
       } else if (subcommand === "service" || subcommand === "services") {
         await cmdHostService(api, positional.slice(2), flags);
       } else if (subcommand === "destroy") {
@@ -2634,7 +2850,7 @@ const main = async () => {
         await cmdHostRemove(api, positional.slice(2), flags);
       } else {
         logger.error(
-          `ddc host <prepare|list|get|create|update|provision|deprovision|test|service|destroy|remove>`
+          `ddc host <prepare|list|get|create|update|provision|deprovision|test|inspect|service|destroy|remove>`
         );
         process.exit(1);
       }
