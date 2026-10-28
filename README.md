@@ -234,6 +234,40 @@ Prepare a host for deployment. This will install the necessary services and conf
 ddc host prepare <host-id>
 ```
 
+### `ddc host inspect`
+
+Check a host and get a report of 13 areas (containers, Docker, journal, kernel, packages, boot, resources, services, ports and firewall, web analytics, SSH access, managed services and apps), each with an ok, warn or error status. Inspection only reads, it changes nothing on the server and masks secrets in the output. Needs the Maintain role.
+
+```bash
+# Inspect a host and wait for the report (exits 1 when the status is error)
+ddc host inspect create <host-id> --wait
+
+# Inspect the last 3 days, only some sections, or only one app on the host
+ddc host inspect create <host-id> --since 3d --sections docker,packages --app <app-id>
+
+# Show the latest report, or an older one by its id
+ddc host inspect get <host-id>
+ddc host inspect get <host-id> --inspection <inspection-id>
+
+# List inspections, newest first
+ddc host inspect list <host-id> --limit 5
+
+# Save the full output as JSON (default file name from the server, - for stdout)
+ddc host inspect download <host-id>
+ddc host inspect download <host-id> --inspection <inspection-id> --output report.json --force
+```
+
+| Option         | Description                                                   | Default         |
+| -------------- | ------------------------------------------------------------- | --------------- |
+| `--app`        | create: inspect only this app on the host                     | all apps        |
+| `--since`      | create: start of the window, `90m`, `24h`, `3d` or ISO date   | `24h` (max 7d)  |
+| `--sections`   | create: comma separated sections to inspect                   | all             |
+| `--wait`       | create: wait for the inspection and show the report           | `false`         |
+| `--timeout`    | create: wait timeout in ms                                    | 10 minutes      |
+| `--inspection` | get / download: an inspection id from `ddc host inspect list` | latest          |
+| `--output`     | download: file to save to, `-` for stdout                     | server filename |
+| `--force`      | download: overwrite an existing file                          | `false`         |
+
 ### `ddc host service`
 
 Manage the services (Docker, PostgreSQL, etc.) installed on a host.
