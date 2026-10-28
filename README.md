@@ -101,12 +101,13 @@ ddc auth --api-key <key>        # Save the given API key (non-interactive)
 ```
 
 - **Browser login (default):** ddc starts a one-off listener on `127.0.0.1`, opens the consent page (and prints its URL), and saves the token when you approve. It waits up to 5 minutes. The token shows up as "DollarDeploy CLI" in **Settings** -> **API Keys**, where you can delete it.
-- **`--no-browser`:** ddc prints the URL instead of opening it. Open it in a browser on any machine and approve. The browser is then redirected to `http://127.0.0.1:<port>/callback?code=...`, which fails to load on your laptop. Copy that address from the address bar and paste it into the terminal.
+- **`--no-browser`:** ddc prints the URL instead of opening it. Open it in a browser on any machine and approve. The browser is then redirected to `http://127.0.0.1:<port>/callback?code=...`, which fails to load on your laptop. Copy that address from the address bar and paste it into the terminal. This is the default in an SSH session (`SSH_CONNECTION` or `SSH_TTY` is set).
+- The whole sign-in, including the token exchange, must finish within 5 minutes.
 - **`--paste` / `--api-key`:** save an API key you created in Settings, as before.
 
 API key resolution order: `--api-key` flag > `DOLLARDEPLOY_API_KEY` env var > `~/.dollardeploy/auth` file.
 
-**Revoked token:** if the token in `~/.dollardeploy/auth` is deleted or revoked, the next command run in a terminal signs in with the browser again and then continues. A key from `--api-key` or `DOLLARDEPLOY_API_KEY`, or a run without a terminal (CI), fails with ``Token is unknown or revoked. Run `ddc auth` to sign in again.`` and the auth file is left untouched.
+**Revoked token:** if the token in `~/.dollardeploy/auth` is deleted or revoked, the next command run in a terminal signs in with the browser again and then continues. Over SSH, or with `--no-browser` on that command, it asks you to paste the redirected URL instead. A key from `--api-key` or `DOLLARDEPLOY_API_KEY`, or a run without a terminal (CI), fails with ``Token is unknown or revoked. Run `ddc auth` to sign in again.`` and the auth file is left untouched.
 
 ### `ddc user` / `ddc auth status`
 

@@ -204,6 +204,10 @@ const prompt = (question, signal) =>
       rl.close();
       reject(signal.reason);
     };
+    if (signal?.aborted) {
+      handleAbort();
+      return;
+    }
     if (signal) {
       signal.addEventListener("abort", handleAbort, { once: true });
     }
@@ -250,10 +254,15 @@ const isHttpUrl = value => {
   }
 };
 
-/** Finds the OAuth endpoints from the protected resource and authorization server metadata */
-const discoverOAuth = async baseUrl => {
+/**
+ * Finds the OAuth endpoints from the protected resource and authorization server metadata
+ * @param {string} baseUrl
+ * @param {AbortSignal} [signal] Cancels the requests
+ */
+const discoverOAuth = async (baseUrl, signal) => {
   const resource = await fetchOAuthJson(
-    new URL("/.well-known/oauth-protected-resource", baseUrl).toString()
+    new URL("/.well-known/oauth-protected-resource", baseUrl).toString(),
+    { signal }
   );
   const issuer = resource.authorization_servers?.[0];
   if (!isHttpUrl(issuer)) {
@@ -261,7 +270,8 @@ const discoverOAuth = async baseUrl => {
   }
 
   const server = await fetchOAuthJson(
-    new URL("/.well-known/oauth-authorization-server", issuer).toString()
+    new URL("/.well-known/oauth-authorization-server", issuer).toString(),
+    { signal }
   );
   const endpoints = ["authorization_endpoint", "token_endpoint", "registration_endpoint"];
   const missing = endpoints.filter(name => !isHttpUrl(server[name]));
@@ -398,21 +408,47 @@ const promptCallbackUrl = async (state, signal) => {
 };
 
 /**
+ * Paste the redirected URL instead of opening a browser: with --no-browser, or over SSH where the
+ * browser runs on another machine and its redirect can't reach this machine's 127.0.0.1.
+ * @param {Record<string, unknown>} flags
+ * @param {NodeJS.ProcessEnv} [env]
+ */
+const isNoBrowserLogin = (flags, env = process.env) =>
+  flags["no-browser"] === true || Boolean(env.SSH_CONNECTION || env.SSH_TTY);
+
+/** Rejects with the signal's reason once it is aborted */
+const rejectOnAbort = signal =>
+  new Promise((_, reject) => {
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
+
+/**
  * Signs in through the browser and saves the token to the auth file.
+ * One deadline covers the whole sign-in: discovery, registration, approval and token exchange.
  * @param {string} baseUrl
  * @param {{ noBrowser?: boolean }} [options] noBrowser: print the URL and read the redirect from stdin
  * @returns {Promise<string>} The new access token
  */
 const browserLogin = async (baseUrl, { noBrowser = false } = {}) => {
-  const oauth = await discoverOAuth(baseUrl);
-  const state = randomToken();
-  const pkce = createPkce();
-  const callback = await startCallbackServer(state);
-  const stopPrompt = new AbortController();
-  let timer;
+  const deadline = new AbortController();
+  const timer = setTimeout(
+    () =>
+      deadline.abort(
+        new Error("Sign-in timed out after 5 minutes. Run `ddc auth` to try again.")
+      ),
+    OAUTH_LOGIN_TIMEOUT
+  );
+  const { signal } = deadline;
+  let callback;
 
   try {
+    const oauth = await discoverOAuth(baseUrl, signal);
+    const state = randomToken();
+    const pkce = createPkce();
+    callback = await startCallbackServer(state);
+
     const client = await fetchOAuthJson(oauth.registration_endpoint, {
+      signal,
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -437,20 +473,14 @@ const browserLogin = async (baseUrl, { noBrowser = false } = {}) => {
       logger.info("Waiting for you to approve access in the browser...");
     }
 
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(
-        () =>
-          reject(new Error("Sign-in timed out after 5 minutes. Run `ddc auth` to try again.")),
-        OAUTH_LOGIN_TIMEOUT
-      );
-    });
-    const sources = [callback.code, timeout];
+    const sources = [callback.code, rejectOnAbort(signal)];
     if (noBrowser) {
-      sources.push(promptCallbackUrl(state, stopPrompt.signal));
+      sources.push(promptCallbackUrl(state, signal));
     }
     const code = await Promise.race(sources);
 
     const token = await fetchOAuthJson(oauth.token_endpoint, {
+      signal,
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -469,8 +499,11 @@ const browserLogin = async (baseUrl, { noBrowser = false } = {}) => {
     return token.access_token;
   } finally {
     clearTimeout(timer);
-    stopPrompt.abort(new Error("Sign-in finished"));
-    callback.close();
+    // Stops a pending paste prompt once the browser callback won the race
+    deadline.abort(new Error("Sign-in finished"));
+    if (callback) {
+      callback.close();
+    }
   }
 };
 
@@ -1036,6 +1069,7 @@ const cmdAuth = async (_api, _positional, flags) => {
       "ddc auth [--no-browser | --paste | --api-key <key>] [--base-url <url>]\n" +
         "  (default)          Sign in with the browser, the token is saved to ~/.dollardeploy/auth\n" +
         "  --no-browser       Print the URL, approve in any browser, paste the redirected URL\n" +
+        "                     (the default over SSH)\n" +
         "  --paste            Paste an API key created in Settings -> API Keys\n" +
         "  --api-key <key>    Save the given API key"
     );
@@ -1060,7 +1094,7 @@ const cmdAuth = async (_api, _positional, flags) => {
     return;
   }
 
-  await browserLogin(findAuth(baseUrl).baseUrl, { noBrowser: flags["no-browser"] === true });
+  await browserLogin(findAuth(baseUrl).baseUrl, { noBrowser: isNoBrowserLogin(flags) });
   logger.info("Signed in. Token saved to ~/.dollardeploy/auth");
   if (process.env.DOLLARDEPLOY_API_KEY) {
     logger.warn("DOLLARDEPLOY_API_KEY is set and is used instead of the saved token.");
@@ -2850,13 +2884,14 @@ GLOBAL OPTIONS
 
 AUTH & USER INFO
   ddc auth                      Sign in with the browser (opens it), token saved to ~/.dollardeploy/auth
-  ddc auth --no-browser         SSH/remote: print the URL, approve in any browser, paste the redirected URL
+  ddc auth --no-browser         Print the URL, approve in any browser, paste the redirected URL (default over SSH)
   ddc auth --paste              Interactive prompt to paste an API key from Settings
   ddc auth --api-key <key>      Save API key non-interactively
   ddc user                      Show user, tenant and roles
   ddc auth status               Same as ddc user
-  If the saved token is revoked, commands run in a terminal sign in again with the browser.
-  With --api-key, DOLLARDEPLOY_API_KEY or without a terminal (CI) they fail instead.
+  If the saved token is revoked, commands run in a terminal sign in again with the browser
+  (pass --no-browser to paste the redirected URL instead). With --api-key, DOLLARDEPLOY_API_KEY
+  or without a terminal (CI) they fail instead.
 
 HOST CREATE OPTIONS
   --name <name>                 Host name
@@ -3100,7 +3135,7 @@ const main = async () => {
     const canRelogin = auth.source === "file" && process.stdin.isTTY && process.stderr.isTTY;
     const handleInvalidToken = () => {
       logger.info("Your DollarDeploy token is unknown or was revoked, signing in again...");
-      return browserLogin(auth.baseUrl);
+      return browserLogin(auth.baseUrl, { noBrowser: isNoBrowserLogin(flags) });
     };
 
     const api = createApiClient(auth, {
@@ -3211,9 +3246,12 @@ if (require.main === module) {
 }
 
 module.exports = {
+  browserLogin,
   createApiClient,
   createPkce,
   isInvalidTokenResponse,
+  isNoBrowserLogin,
+  OAUTH_LOGIN_TIMEOUT,
   parseCallbackUrl,
   startCallbackServer,
   REVOKED_TOKEN_MESSAGE,
