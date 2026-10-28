@@ -6,8 +6,10 @@
 
 const fs = require("fs");
 const path = require("path");
+const http = require("http");
+const crypto = require("crypto");
 const readline = require("readline");
-const { execFileSync } = require("child_process");
+const { execFileSync, spawn } = require("child_process");
 const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 const packageJson = require("./package.json");
@@ -17,6 +19,9 @@ const DEFAULT_BASE_URL = "https://dollardeploy.com";
 const DEFAULT_TIMEOUT = 600000; // 10 minutes
 const AUTH_DIR = path.join(require("os").homedir(), ".dollardeploy");
 const AUTH_FILE = path.join(AUTH_DIR, "auth");
+const OAUTH_CLIENT_NAME = "DollarDeploy CLI";
+const OAUTH_LOGIN_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+const REVOKED_TOKEN_MESSAGE = "Token is unknown or revoked. Run `ddc auth` to sign in again.";
 
 const PROVIDER_DEFAULTS = {
   hetzner: {
@@ -127,41 +132,44 @@ const withQuery = (url, params) => {
 
 // ─── Auth helpers ────────────────────────────────────────────────────────────
 
-const findAuth = baseUrl => {
-  // 1. Environment variable takes priority
-  if (process.env.DOLLARDEPLOY_API_KEY) {
-    let parsedBaseUrl = undefined;
-    if (fs.existsSync(AUTH_FILE)) {
-      const content = fs.readFileSync(AUTH_FILE, "utf-8").trim();
-      const parsed = JSON.parse(content);
-      parsedBaseUrl = parsed.baseUrl;
-    }
-
-    return {
-      apiKey: process.env.DOLLARDEPLOY_API_KEY,
-      baseUrl:
-        baseUrl ?? parsedBaseUrl ?? process.env.DOLLARDEPLOY_BASE_URL ?? DEFAULT_BASE_URL
-    };
-  }
-
-  // 2. Stored auth file
+const readAuthFile = () => {
   try {
-    if (fs.existsSync(AUTH_FILE)) {
-      const content = fs.readFileSync(AUTH_FILE, "utf-8").trim();
-      const parsed = JSON.parse(content);
-      return {
-        apiKey: parsed.apiKey,
-        baseUrl:
-          baseUrl ?? parsed.baseUrl ?? process.env.DOLLARDEPLOY_BASE_URL ?? DEFAULT_BASE_URL
-      };
-    } else {
+    if (!fs.existsSync(AUTH_FILE)) {
       return {};
     }
+    return JSON.parse(fs.readFileSync(AUTH_FILE, "utf-8").trim());
   } catch {
     throw new Error(
       "Failed to read auth file. Run `ddc auth` to set it, use --api-key argument or DOLLARDEPLOY_API_KEY env var."
     );
   }
+};
+
+/**
+ * API key and base URL from the environment or the stored auth file.
+ * `source` tells where the key came from: only a key from the auth file is replaced on re-login.
+ * @returns {{ apiKey?: string, baseUrl: string, source?: "env" | "file" }}
+ */
+const findAuth = baseUrl => {
+  const stored = readAuthFile();
+  const resolvedBaseUrl =
+    baseUrl ?? stored.baseUrl ?? process.env.DOLLARDEPLOY_BASE_URL ?? DEFAULT_BASE_URL;
+
+  // 1. Environment variable takes priority
+  if (process.env.DOLLARDEPLOY_API_KEY) {
+    return {
+      apiKey: process.env.DOLLARDEPLOY_API_KEY,
+      baseUrl: resolvedBaseUrl,
+      source: "env"
+    };
+  }
+
+  // 2. Stored auth file
+  if (stored.apiKey) {
+    return { apiKey: stored.apiKey, baseUrl: resolvedBaseUrl, source: "file" };
+  }
+
+  return { baseUrl: resolvedBaseUrl };
 };
 
 const updateAuth = (apiKey, baseUrl) => {
@@ -181,13 +189,28 @@ const updateAuth = (apiKey, baseUrl) => {
 
 // ─── Prompt helper ───────────────────────────────────────────────────────────
 
-const prompt = question =>
-  new Promise(resolve => {
+/**
+ * Asks a question on stderr and reads one line from stdin.
+ * @param {string} question
+ * @param {AbortSignal} [signal] Stops waiting for the answer and rejects
+ */
+const prompt = (question, signal) =>
+  new Promise((resolve, reject) => {
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stderr
     });
+    const handleAbort = () => {
+      rl.close();
+      reject(signal.reason);
+    };
+    if (signal) {
+      signal.addEventListener("abort", handleAbort, { once: true });
+    }
     rl.question(question, answer => {
+      if (signal) {
+        signal.removeEventListener("abort", handleAbort);
+      }
       rl.close();
       resolve(answer.trim());
     });
@@ -202,27 +225,286 @@ const confirm = async question => {
   }
 };
 
-// ─── API client ──────────────────────────────────────────────────────────────
+// ─── Browser login (OAuth authorization code + PKCE) ─────────────────────────
+
+const fetchOAuthJson = async (url, init = {}) => {
+  const response = await fetch(url, {
+    ...init,
+    headers: { "User-Agent": "DollarDeploy-CLI/" + packageJson.version, ...init.headers }
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      `Sign-in request failed (${url}: ${response.status}): ${body.error || body.message || response.statusText}`
+    );
+  }
+  return body;
+};
+
+const isHttpUrl = value => {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:";
+  } catch {
+    return false;
+  }
+};
+
+/** Finds the OAuth endpoints from the protected resource and authorization server metadata */
+const discoverOAuth = async baseUrl => {
+  const resource = await fetchOAuthJson(
+    new URL("/.well-known/oauth-protected-resource", baseUrl).toString()
+  );
+  const issuer = resource.authorization_servers?.[0];
+  if (!isHttpUrl(issuer)) {
+    throw new Error(`${baseUrl} does not announce an OAuth authorization server.`);
+  }
+
+  const server = await fetchOAuthJson(
+    new URL("/.well-known/oauth-authorization-server", issuer).toString()
+  );
+  const endpoints = ["authorization_endpoint", "token_endpoint", "registration_endpoint"];
+  const missing = endpoints.filter(name => !isHttpUrl(server[name]));
+  if (missing.length > 0) {
+    throw new Error(`OAuth server ${issuer} is missing ${missing.join(", ")}.`);
+  }
+  return server;
+};
+
+const randomToken = () => crypto.randomBytes(32).toString("base64url");
+
+/** PKCE S256: the verifier stays here, the server only sees its SHA-256 */
+const createPkce = () => {
+  const verifier = randomToken();
+  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
+  return { verifier, challenge };
+};
 
 /**
- * @param {Object} auth
+ * Authorization code from the URL the browser was redirected to.
+ * Throws when the state is not ours, the user denied access or there is no code.
+ */
+const parseCallbackUrl = (input, expectedState) => {
+  if (!URL.canParse(input)) {
+    throw new Error("That is not a URL. Paste the full address from the browser.");
+  }
+  const params = new URL(input).searchParams;
+  if (params.get("state") !== expectedState) {
+    throw new Error("The sign-in response does not belong to this `ddc auth` run.");
+  }
+  const error = params.get("error");
+  if (error === "access_denied") {
+    throw new Error("Access was denied in the browser.");
+  }
+  if (error) {
+    throw new Error(`Sign-in failed: ${error}`);
+  }
+  const code = params.get("code");
+  if (!code) {
+    throw new Error("The sign-in response has no authorization code.");
+  }
+  return code;
+};
+
+const callbackPage = (title, message) =>
+  `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head>` +
+  `<body><h1>${title}</h1><p>${message}</p></body></html>`;
+
+/**
+ * Local server on a random 127.0.0.1 port that receives the OAuth redirect.
+ * Requests with someone else's state are answered and ignored.
+ */
+const startCallbackServer = state =>
+  new Promise((resolve, reject) => {
+    let handleCode;
+    let handleError;
+    const code = new Promise((resolveCode, rejectCode) => {
+      handleCode = resolveCode;
+      handleError = rejectCode;
+    });
+    // Callers may start waiting later, a denial before that is not an unhandled rejection
+    code.catch(() => {});
+
+    const server = http.createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      const reply = (status, title, message) => {
+        res.writeHead(status, {
+          "Content-Type": "text/html; charset=utf-8",
+          Connection: "close"
+        });
+        res.end(callbackPage(title, message));
+      };
+
+      if (url.pathname !== "/callback") {
+        reply(404, "Not found", "This page is not part of the DollarDeploy sign-in.");
+        return;
+      }
+      if (url.searchParams.get("state") !== state) {
+        reply(400, "Sign-in failed", "This sign-in link is not from the running ddc.");
+        return;
+      }
+
+      try {
+        handleCode(parseCallbackUrl(url.toString(), state));
+        reply(
+          200,
+          "Signed in to DollarDeploy",
+          "You can close this tab and return to the terminal."
+        );
+      } catch (error) {
+        handleError(error);
+        reply(400, "Sign-in failed", "Check the terminal for details.");
+      }
+    });
+
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        redirectUri: `http://127.0.0.1:${server.address().port}/callback`,
+        code,
+        close: () => {
+          server.close();
+          server.closeAllConnections();
+        }
+      });
+    });
+  });
+
+/** Opens the URL in the default browser, without a shell. Returns false if it could not. */
+const openBrowser = url => {
+  const [command, args] =
+    process.platform === "darwin"
+      ? ["open", [url]]
+      : process.platform === "win32"
+        ? ["rundll32", ["url.dll,FileProtocolHandler", url]]
+        : ["xdg-open", [url]];
+  try {
+    const child = spawn(command, args, { detached: true, stdio: "ignore" });
+    child.on("error", () => logger.warn("Could not open the browser, open the URL above."));
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** Reads the redirected URL pasted by the user, for when the browser is on another machine */
+const promptCallbackUrl = async (state, signal) => {
+  const input = await prompt(
+    "After approving, paste the URL your browser was redirected to (it may fail to load):\n> ",
+    signal
+  );
+  return parseCallbackUrl(input, state);
+};
+
+/**
+ * Signs in through the browser and saves the token to the auth file.
+ * @param {string} baseUrl
+ * @param {{ noBrowser?: boolean }} [options] noBrowser: print the URL and read the redirect from stdin
+ * @returns {Promise<string>} The new access token
+ */
+const browserLogin = async (baseUrl, { noBrowser = false } = {}) => {
+  const oauth = await discoverOAuth(baseUrl);
+  const state = randomToken();
+  const pkce = createPkce();
+  const callback = await startCallbackServer(state);
+  const stopPrompt = new AbortController();
+  let timer;
+
+  try {
+    const client = await fetchOAuthJson(oauth.registration_endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_name: OAUTH_CLIENT_NAME,
+        redirect_uris: [callback.redirectUri]
+      })
+    });
+    if (!client.client_id) {
+      throw new Error("OAuth client registration returned no client_id.");
+    }
+
+    const authorizeUrl = new URL(oauth.authorization_endpoint);
+    authorizeUrl.searchParams.set("client_id", client.client_id);
+    authorizeUrl.searchParams.set("redirect_uri", callback.redirectUri);
+    authorizeUrl.searchParams.set("code_challenge", pkce.challenge);
+    authorizeUrl.searchParams.set("code_challenge_method", "S256");
+    authorizeUrl.searchParams.set("state", state);
+
+    logger.info(`Open this URL to sign in to DollarDeploy:\n\n  ${authorizeUrl}\n`);
+    if (!noBrowser) {
+      openBrowser(authorizeUrl.toString());
+      logger.info("Waiting for you to approve access in the browser...");
+    }
+
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(new Error("Sign-in timed out after 5 minutes. Run `ddc auth` to try again.")),
+        OAUTH_LOGIN_TIMEOUT
+      );
+    });
+    const sources = [callback.code, timeout];
+    if (noBrowser) {
+      sources.push(promptCallbackUrl(state, stopPrompt.signal));
+    }
+    const code = await Promise.race(sources);
+
+    const token = await fetchOAuthJson(oauth.token_endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        code_verifier: pkce.verifier,
+        redirect_uri: callback.redirectUri,
+        client_id: client.client_id
+      })
+    });
+    if (!token.access_token) {
+      throw new Error("The token endpoint returned no access_token.");
+    }
+
+    updateAuth(token.access_token, baseUrl);
+    return token.access_token;
+  } finally {
+    clearTimeout(timer);
+    stopPrompt.abort(new Error("Sign-in finished"));
+    callback.close();
+  }
+};
+
+// ─── API client ──────────────────────────────────────────────────────────────
+
+/** 401 with `WWW-Authenticate: Bearer error="invalid_token"`: the key is unknown or revoked */
+const isInvalidTokenResponse = response =>
+  response.status === 401 &&
+  (response.headers.get("www-authenticate") ?? "").includes('error="invalid_token"');
+
+/**
+ * @param {{ apiKey?: string, baseUrl?: string }} auth
+ * @param {{ onInvalidToken?: () => Promise<string> }} [options]
+ *   onInvalidToken: called once when the key is unknown or revoked, resolves to a new key and the
+ *   request is retried with it. Without it such requests fail with "run `ddc auth`".
  * @returns {Object} API client
  */
-const createApiClient = auth => {
+const createApiClient = (auth, { onInvalidToken } = {}) => {
   if (!auth.apiKey) {
     throw new Error(
       "API key is required. Run `ddc auth` to set it, or use --api-key or DOLLARDEPLOY_API_KEY."
     );
   }
 
-  const apiKey = auth.apiKey;
+  let apiKey = auth.apiKey;
   const baseUrl = auth.baseUrl ?? DEFAULT_BASE_URL;
+  // Shared by concurrent requests, so a revoked key opens the browser only once
+  let relogin;
 
-  const headers = {
+  const headers = () => ({
     "Content-Type": "application/json",
     Authorization: `Bearer ${apiKey}`,
     "User-Agent": "DollarDeploy-CLI/" + packageJson.version
-  };
+  });
 
   const apiError = (response, message) =>
     Object.assign(
@@ -256,68 +538,43 @@ const createApiClient = auth => {
     }
   };
 
-  const post = (url, body) => {
-    logger.verbose(`POST ${url}...`);
+  const send = async (method, url, body) => {
+    logger.verbose(`${method} ${url}...`);
     const startTime = Date.now();
-    return fetch(new URL(url, baseUrl).toString(), {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body)
-    }).then(res => {
-      logger.verbose(`POST ${url} (status: ${res.status}) Δ ${Date.now() - startTime}ms`);
-      return handleResponse(res);
+    const response = await fetch(new URL(url, baseUrl).toString(), {
+      method,
+      headers: headers(),
+      body: body === undefined ? undefined : JSON.stringify(body)
     });
+    logger.verbose(
+      `${method} ${url} (status: ${response.status}) Δ ${Date.now() - startTime}ms`
+    );
+    return response;
   };
 
-  const patch = (url, body) => {
-    logger.verbose(`PATCH ${url}...`);
-    const startTime = Date.now();
-    return fetch(new URL(url, baseUrl).toString(), {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify(body)
-    }).then(res => {
-      logger.verbose(`PATCH ${url} (status: ${res.status}) Δ ${Date.now() - startTime}ms`);
-      return handleResponse(res);
-    });
+  // Sends the request, signing in again and retrying once if the key is unknown or revoked
+  const request = async (method, url, body) => {
+    const response = await send(method, url, body);
+    if (!isInvalidTokenResponse(response)) {
+      return response;
+    }
+    if (!onInvalidToken) {
+      throw Object.assign(new Error(REVOKED_TOKEN_MESSAGE), {
+        url: response.url,
+        status: 401
+      });
+    }
+    relogin ??= onInvalidToken();
+    apiKey = await relogin;
+    return send(method, url, body);
   };
 
-  const del = url => {
-    logger.verbose(`DELETE ${url}...`);
-    const startTime = Date.now();
-    return fetch(new URL(url, baseUrl).toString(), {
-      method: "DELETE",
-      headers
-    }).then(res => {
-      logger.verbose(`DELETE ${url} (status: ${res.status}) Δ ${Date.now() - startTime}ms`);
-      return handleResponse(res);
-    });
-  };
-
-  const get = url => {
-    logger.verbose(`GET ${url}...`);
-    const startTime = Date.now();
-    return fetch(new URL(url, baseUrl).toString(), {
-      method: "GET",
-      headers
-    }).then(res => {
-      logger.verbose(`GET ${url} (status: ${res.status}) Δ ${Date.now() - startTime}ms`);
-      return handleResponse(res);
-    });
-  };
-
+  const post = (url, body) => request("POST", url, body).then(handleResponse);
+  const patch = (url, body) => request("PATCH", url, body).then(handleResponse);
+  const del = url => request("DELETE", url).then(handleResponse);
+  const get = url => request("GET", url).then(handleResponse);
   // GET returning the response itself, to stream the body
-  const download = url => {
-    logger.verbose(`GET ${url}...`);
-    const startTime = Date.now();
-    return fetch(new URL(url, baseUrl).toString(), {
-      method: "GET",
-      headers
-    }).then(res => {
-      logger.verbose(`GET ${url} (status: ${res.status}) Δ ${Date.now() - startTime}ms`);
-      return assertOk(res);
-    });
-  };
+  const download = url => request("GET", url).then(assertOk);
 
   return {
     baseUrl,
@@ -774,21 +1031,40 @@ const cmdAuth = async (_api, _positional, flags) => {
   const apiKey = flags["api-key"] || flags.apiKey;
   const baseUrl = flags["base-url"] || flags.baseUrl;
 
+  if (flags.help) {
+    logger.info(
+      "ddc auth [--no-browser | --paste | --api-key <key>] [--base-url <url>]\n" +
+        "  (default)          Sign in with the browser, the token is saved to ~/.dollardeploy/auth\n" +
+        "  --no-browser       Print the URL, approve in any browser, paste the redirected URL\n" +
+        "  --paste            Paste an API key created in Settings -> API Keys\n" +
+        "  --api-key <key>    Save the given API key"
+    );
+    process.exit(0);
+  }
+
   if (apiKey) {
     updateAuth(apiKey, baseUrl);
     logger.info("API key saved to ~/.dollardeploy/auth");
     return;
   }
 
-  // Interactive mode
-  const key = await prompt("Enter your DollarDeploy API key: ");
-  if (!key) {
-    logger.error("No API key provided. Aborting.");
-    process.exit(1);
+  if (flags.paste) {
+    const key = await prompt("Enter your DollarDeploy API key: ");
+    if (!key) {
+      logger.error("No API key provided. Aborting.");
+      process.exit(1);
+    }
+
+    updateAuth(key, baseUrl);
+    logger.info("API key saved to ~/.dollardeploy/auth");
+    return;
   }
 
-  updateAuth(key, baseUrl);
-  logger.info("API key saved to ~/.dollardeploy/auth");
+  await browserLogin(findAuth(baseUrl).baseUrl, { noBrowser: flags["no-browser"] === true });
+  logger.info("Signed in. Token saved to ~/.dollardeploy/auth");
+  if (process.env.DOLLARDEPLOY_API_KEY) {
+    logger.warn("DOLLARDEPLOY_API_KEY is set and is used instead of the saved token.");
+  }
 };
 
 const cmdHostList = async (api, _positional, flags) => {
@@ -2523,7 +2799,7 @@ USAGE
   ddc <command> [options]
 
 COMMANDS
-  auth                          Authenticate with DollarDeploy
+  auth                          Sign in with the browser and save the token
   auth status                   Show current user, tenant and roles (alias of user)
   host list                     List all hosts
   host get <id>                 Show a single host
@@ -2573,10 +2849,14 @@ GLOBAL OPTIONS
   --version, -V                 Show version
 
 AUTH & USER INFO
-  ddc auth                      Interactive prompt to save API key
+  ddc auth                      Sign in with the browser (opens it), token saved to ~/.dollardeploy/auth
+  ddc auth --no-browser         SSH/remote: print the URL, approve in any browser, paste the redirected URL
+  ddc auth --paste              Interactive prompt to paste an API key from Settings
   ddc auth --api-key <key>      Save API key non-interactively
   ddc user                      Show user, tenant and roles
   ddc auth status               Same as ddc user
+  If the saved token is revoked, commands run in a terminal sign in again with the browser.
+  With --api-key, DOLLARDEPLOY_API_KEY or without a terminal (CI) they fail instead.
 
 HOST CREATE OPTIONS
   --name <name>                 Host name
@@ -2801,25 +3081,31 @@ const main = async () => {
     process.exit(0);
   }
 
-  // Auth doesn't need an API key, except `auth status` which is an alias of `user`
-  const isAuthStatus = command === "auth" && subcommand === "status";
-  if (command === "auth" && !isAuthStatus) {
-    await cmdAuth(null, positional.slice(1), flags);
-    return;
-  }
-
-  // All other commands require auth
-  const auth = {
-    apiKey: flags["api-key"] || flags.apiKey,
-    baseUrl: flags["base-url"] || flags.baseUrl
-  };
-
-  if (!auth.apiKey) {
-    Object.assign(auth, findAuth(auth.baseUrl));
-  }
-
   try {
-    const api = createApiClient(auth);
+    // Auth doesn't need an API key, except `auth status` which is an alias of `user`
+    const isAuthStatus = command === "auth" && subcommand === "status";
+    if (command === "auth" && !isAuthStatus) {
+      await cmdAuth(null, positional.slice(1), flags);
+      return;
+    }
+
+    // All other commands require auth
+    const flagApiKey = flags["api-key"] || flags.apiKey;
+    const auth = flagApiKey
+      ? { apiKey: flagApiKey, baseUrl: flags["base-url"] || flags.baseUrl, source: "flag" }
+      : findAuth(flags["base-url"] || flags.baseUrl);
+
+    // Sign in again only for a key from the auth file and when someone is at the terminal.
+    // Keys from --api-key or DOLLARDEPLOY_API_KEY, and CI runs, fail and keep the auth file.
+    const canRelogin = auth.source === "file" && process.stdin.isTTY && process.stderr.isTTY;
+    const handleInvalidToken = () => {
+      logger.info("Your DollarDeploy token is unknown or was revoked, signing in again...");
+      return browserLogin(auth.baseUrl);
+    };
+
+    const api = createApiClient(auth, {
+      onInvalidToken: canRelogin ? handleInvalidToken : undefined
+    });
 
     if (command === "user" || isAuthStatus) {
       await cmdUser(api);
@@ -2926,6 +3212,11 @@ if (require.main === module) {
 
 module.exports = {
   createApiClient,
+  createPkce,
+  isInvalidTokenResponse,
+  parseCallbackUrl,
+  startCallbackServer,
+  REVOKED_TOKEN_MESSAGE,
   waitForTask,
   checkUrl
 };
