@@ -21,17 +21,25 @@ npx @dollardeploy/cli help
 
 ## Quick Start
 
-### 1. Sign in
+### 1. Get an API Key
+
+1. Sign in at [dollardeploy.com](https://dollardeploy.com)
+2. Go to **Settings** → **API Keys**
+3. Click **Create API Key** and copy it
+
+### 2. Authenticate
 
 ```bash
+# Interactive
 ddc auth
+
+# Non-interactive
+ddc auth --api-key <your-api-key>
 ```
 
-`ddc auth` opens your browser, you approve access on dollardeploy.com, and the CLI saves the token to `~/.dollardeploy/auth`. No API key to copy.
+Your API key is saved to `~/.dollardeploy/auth` and can be overridden with the `--api-key` flag or `DOLLARDEPLOY_API_KEY` environment variable.
 
-On a server over SSH, use `ddc auth --no-browser` (see [`ddc auth`](#ddc-auth)). For CI, create an API key in **Settings** -> **API Keys** and pass it with `--api-key` or `DOLLARDEPLOY_API_KEY`.
-
-### 2. Deploy
+### 3. Deploy
 
 ```bash
 # Deploy the git repo in the current folder (detects repo, env, shows overview)
@@ -91,23 +99,14 @@ ddc host remove <host-id>
 
 ### `ddc auth`
 
-Sign in and save the token for future commands.
+Save your API key for future commands.
 
 ```bash
-ddc auth                        # Sign in with the browser
-ddc auth --no-browser           # SSH / remote host: approve in any browser, paste the redirected URL
-ddc auth --paste                # Paste an API key created in Settings -> API Keys
-ddc auth --api-key <key>        # Save the given API key (non-interactive)
+ddc auth                        # Interactive prompt
+ddc auth --api-key <key>        # Non-interactive
 ```
 
-- **Browser login (default):** ddc starts a one-off listener on `127.0.0.1`, opens the consent page (and prints its URL), and saves the token when you approve. It waits up to 5 minutes. The token shows up as "DollarDeploy CLI" in **Settings** -> **API Keys**, where you can delete it.
-- **`--no-browser`:** ddc prints the URL instead of opening it. Open it in a browser on any machine and approve. The browser is then redirected to `http://127.0.0.1:<port>/callback?code=...`, which fails to load on your laptop. Copy that address from the address bar and paste it into the terminal. This is the default in an SSH session (`SSH_CONNECTION` or `SSH_TTY` is set).
-- The whole sign-in, including the token exchange, must finish within 5 minutes.
-- **`--paste` / `--api-key`:** save an API key you created in Settings, as before.
-
 API key resolution order: `--api-key` flag > `DOLLARDEPLOY_API_KEY` env var > `~/.dollardeploy/auth` file.
-
-**Revoked token:** if the token in `~/.dollardeploy/auth` is deleted or revoked, the next command run in a terminal signs in with the browser again and then continues. Over SSH, or with `--no-browser` on that command, it asks you to paste the redirected URL instead. A key from `--api-key` or `DOLLARDEPLOY_API_KEY`, or a run without a terminal (CI), fails with ``Token is unknown or revoked. Run `ddc auth` to sign in again.`` and the auth file is left untouched.
 
 ### `ddc user` / `ddc auth status`
 
