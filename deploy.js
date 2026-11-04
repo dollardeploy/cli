@@ -2393,7 +2393,7 @@ const CRON_OPTIONS_HELP = `  --app <id> | --host <id>      Target (create only):
   --method <GET|POST>           http: request method (default GET)
   --authEnvVar <name>           http: app env var with the bearer secret (default CRON_SECRET), alias --secret
   --command <cmd>               command: shell command, alias --cmd
-  --retries <0-3>               Retries on failure (default 0)
+  --retries <0-3>               Retries on failure (default 1)
   --notify <failed,success>     When to send a notification (default failed)
   --enabled true|false          Enable or disable, or --disabled`;
 

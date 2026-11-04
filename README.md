@@ -582,7 +582,7 @@ The first HTTP cron on an app generates `CRON_SECRET` on the app env. Redeploy t
 | `--method`     | `GET` or `POST`                                                    | `GET`         |
 | `--authEnvVar` | App env var holding the bearer secret, alias `--secret`            | `CRON_SECRET` |
 | `--command`    | Shell command, alias `--cmd`                                       | -             |
-| `--retries`    | Retries on failure, 0 to 3                                         | `0`           |
+| `--retries`    | Retries on failure, 0 to 3                                         | `1`           |
 | `--notify`     | When to send a notification: `failed`, `success` (comma separated) | `failed`      |
 | `--disabled`   | Create or update the cron as disabled (`--enabled true` to enable) | -             |
 
