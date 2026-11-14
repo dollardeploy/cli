@@ -185,7 +185,7 @@ ddc host update <host-id> --env POSTGRES_VERSION=17 --env POSTGRES_DATABASES=app
 | `--description`     | Host description                                    |
 | `--ip`              | IP address or DNS name used for SSH                 |
 | `--username`        | SSH username                                        |
-| `--sshKeyId`        | SSH key to use (see `ddc ssh list`)                 |
+| `--sshKeyId`        | Managed SSH key ID (see `ddc ssh list`)             |
 | `--swap`            | Swap size in MB, applied on the next `host prepare` |
 | `--projectId`       | Move the host to a project                          |
 | `--backupSchedule`  | Backup schedule (cron expression)                   |
@@ -515,6 +515,8 @@ ddc ssh add ${HOME}/.ssh/id_rsa --name my-key
 | Option   | Description                       |
 | -------- | --------------------------------- |
 | `--name` | Key name (default: cli-added-key) |
+
+Hosts reference a managed key by ID (`ddc host update <host-id> --sshKeyId <key-id>`, API field `privateKeyId`). Pasting a private key on the host itself is no longer supported.
 
 ### `ddc ssh list`
 
